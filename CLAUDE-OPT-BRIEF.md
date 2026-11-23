@@ -1,0 +1,43 @@
+# Brief for Claude Code — Đá Banh iOS + tvOS code audit & optimisation (copy repo only)
+
+**Repo you work on:** `zjoenguyenz/dabanh-ios-opt` — a full copy of the production repo at Đá Banh iOS 1.35/36 + Đá Banh TV 1.3.5/17. The production repo `zjoenguyenz/dabanh-ios` is READ-ONLY for you: never push there, never open PRs there. All work lands on the copy as small, independently revertible PRs. Nothing you produce ships directly — the leader verifies every claim against the production tree, and anything ported back passes the project's own Swift review gates (3 consecutive clean rounds, per platform) before it can reach a build.
+
+## What these apps are
+One repo, one XcodeGen `project.yml`, two apps in scope:
+- **DaBanh (iOS)** — bundle `com.luun.nguyen.dabanh`, version 1.35/36, MinimumOS iOS 17.0, **Swift 6 language mode for this target only** (the project base stays Swift 5.9). Owner's device: iPhone 18 Pro Max on iOS 27.2. A football app: live match board (ESPN + FotMob data), tap-to-play streaming via an M3U playlist, team crests, and a Highlights tab fed by `highlights.json`.
+- **DaBanhTV (tvOS)** — bundle `com.luun.nguyen.dabanhtv`, version 1.3.5/17, MinimumOS tvOS 17.0, Swift 5.9 mode, plus the `DaBanhTVTopShelf` extension. Target: Apple TV 4K on tvOS 27.x. Same football product for the TV.
+
+Both apps are unsigned IPAs built by GitHub Actions (`.github/workflows/build-dabanh.yml`, workflow_dispatch, XcodeGen). **Version numbers live in TWO places per target in project.yml — the `settings` pair (MARKETING_VERSION / CURRENT_PROJECT_VERSION) AND the `info.properties` pair (CFBundleShortVersionString / CFBundleVersion); the info pair is what the device shows. Any version edit must touch both.**
+
+**Out of scope inside this same repo:** the `JoeTV`, `TV`, and `JoeTVTopShelf` targets and `.github/workflows/build-joetv.yml` belong to a different app family with its own optimisation track. Do not audit, modify, or build them.
+
+## Shared core — the drift surface
+These files compile into BOTH apps and must stay semantically identical in behaviour: `DaBanh/Channel.swift`, `DaBanh/Crests.swift`, `DaBanh/TeamNameNorm.swift`, `DaBanh/LeagueClassifier.swift`, `DaBanh/M3UParser.swift`, `DaBanh/PlaylistStore.swift`, and `crests/crests.json` (bundled crest index; both apps also refresh crest data at launch from the separate `dabanh-playlist` repo). Any change to a shared file must be labelled **SHARED-CORE** in the PR — it ships to two platforms at once.
+Note what is NOT shared: fixture matching and match state (`DaBanh/MatchStateStore.swift`) exist only on iOS; the tvOS app implements its own equivalent logic inside `DaBanhTV/TVContentView.swift` / `TVMatchViews.swift`. Auditing the drift between those two implementations is an explicit audit class (G below).
+
+## The owner's requirements — these are laws, not preferences
+1. **Correctness and playback reliability outrank everything.** These apps' value is that fixtures merge correctly (no duplicate matches), the right links attach to the right match, and tapping a match plays. Any optimisation that changes observable behaviour (fixture merging, link resolution results, playback routing, timings, retry counts) must be flagged as a BEHAVIOUR CHANGE with evidence, never smuggled in as a "cleanup".
+2. **Zero design/UI changes.** Both apps carry owner-approved themes (Classic + MU + "MU Wally" on iOS) frozen under an absolute design gate. Code-only work: no layout, focus, colour, text, or navigation changes.
+3. **Protected machinery — flag, don't touch silently:** the resolve/play core (`DaBanh/PlayerView.swift` — ResolveHub + MatchPlaySession — and `DaBanhTV/TVPlayerView.swift`), the playlist fetch path (`PlaylistStore.swift`, `M3UParser.swift`), the fixture-matching core (`MatchStateStore.swift`, the `TeamNameNorm.swift` alias table, `LeagueClassifier.swift`), and the crest refresh path (`Crests.swift`). These carry hard-won, device-proven behaviour — the alias table in particular is the accumulated cure for a recurring duplicate-fixture disease. You may analyse them and PROPOSE changes with a written risk analysis, but do not include changes to them in an optimisation PR without that analysis attached.
+4. **Diagnostic logging is a feature, not noise.** Both apps ship a built-in diagnostic log export; the `DiagLog` witness lines are how faults get convicted from device evidence. Do not remove or quiet them.
+5. **No secrets in code.** If you find credential material hardcoded anywhere, report it as a P1 finding instead of fixing it quietly.
+6. **Platform rules:** tvOS focus is rendered by the OS — do not hand-draw focus chrome. iOS target is Swift 6 language mode — do not weaken concurrency checking to make warnings go away. No deprecated APIs where a supported iOS 27 / tvOS 27 API exists. No fabricated APIs: if you cannot verify an API exists in the current SDK, say so instead of using it.
+7. **Measurement before claims.** "Faster/lighter" claims need a before/after measurement method stated in the PR (what was measured, on what code path). Unmeasured performance claims are labelled as such.
+
+## What to do, in order
+**Phase 1 — Audit report (no code changes).** Read the whole Đá Banh tree (both apps + shared core + the collector tool). Produce `AUDIT.md` on the copy repo ranking findings by impact ÷ risk, each with file:line evidence, in these classes:
+- A. Performance: startup path, match-board rendering, crest/image loading, JSON parsing (fixtures, crests, highlights), main-thread work, redundant fetches/copies.
+- B. Memory & lifecycle: retain cycles, unbounded caches, task/observer leaks, resource cleanup on playback teardown.
+- C. Concurrency correctness: data races by construction (the iOS target is Swift 6 mode; the tvOS target is 5.9 — assess both), continuation misuse, cancellation holes.
+- D. Code health: dead code, duplicated logic, oversized types/functions that raise change-risk.
+- E. Playback-path and matching-path risks you notice in the protected machinery (report-only per rule 3).
+- F. **Build / CI / SDK alignment — MANDATORY, answer explicitly.** Build BOTH apps on the copy's CI, dissect both IPAs, and read `DTSDKName` / `DTPlatformVersion` against `MinimumOSVersion` in each bundle. A sister project (JTV tvOS) was found compiling with an SDK OLDER than its minimum OS (built with the tvOS 26.5 SDK for a MinimumOSVersion of 27.0). State plainly, per app, whether Đá Banh has that defect or not, with the dissected values as evidence. Leader's pre-measurement on the production iOS 1.35 IPA: `DTSDKName = iphoneos26.5`, `DTXcode = 2660`, `MinimumOSVersion = 17.0` — verify this yourself on the copy's fresh builds, and also assess the inverse gap it reveals: a 17.0 floor and a 26.5 SDK while the owner's devices run iOS/tvOS 27.2 (which 27.x APIs/behaviours the apps therefore cannot use, whether the unpinned `latest-stable` Xcode in CI is a risk, and whether raising the floor or pinning the SDK is advisable — with evidence, not taste).
+- G. **iOS ↔ tvOS drift:** compare the shared-core files' behaviour across both apps and the duplicated fixture-matching/state logic (iOS `MatchStateStore.swift` vs the tvOS implementation). List every behavioural divergence you can prove from the code, and mark which side looks newer/correct.
+- H. **Data contracts:** the app consumes three external data feeds — the M3U playlist, `crests.json` (from the `dabanh-playlist` repo), and `highlights.json` (produced by `tools/highlight_collector.py` in this repo). Audit each reader against the real producer output: a date-format mismatch between the collector and the app's parser already caused one production incident (an empty Highlights tab on a full file). Run the app's parsing logic against real sample payloads where you can; report any contract the code assumes but the producer does not guarantee.
+
+For each finding: what it costs today, the proposed change, the risk, and how to verify no behaviour changed.
+
+**Phase 2 — Optimisation PRs (only after the audit is approved).** One finding (or one tight family) per PR, smallest diff that does the job, each PR stating: the audit item it closes, before/after measurement or the explicit "unmeasured" label, behaviour-change flag (must be NONE unless the audit item itself was approved as one), and SHARED-CORE label where rule on shared files applies. Keep the copy's CI green on every PR (both app targets).
+
+## Out of scope
+New features, new sources, UI work, version bumps, changes to the playlist/crest/highlight data formats, the JoeTV/TV targets, anything on the production repo.
