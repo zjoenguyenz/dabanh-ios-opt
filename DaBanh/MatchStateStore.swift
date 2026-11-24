@@ -1123,6 +1123,11 @@ final class MatchStateStore: ObservableObject {
     private var loopTask: Task<Void, Never>?
     private var refreshing = false
     private var detailCache: [Int: (goals: [GoalEvent], cards: [CardEvent])] = [:]
+    /// E2 (AUDIT.md): the FotMob score a cached `detailCache`
+    /// entry was fetched against, so the refresh cycle can tell
+    /// when a LIVE match has scored (or had a goal taken back)
+    /// since its incidents were fetched, and fetch them again.
+    private var detailScore: [Int: (home: Int?, away: Int?)] = [:]
 
     func start() {
         guard loopTask == nil else { return }
@@ -1222,9 +1227,14 @@ final class MatchStateStore: ObservableObject {
     /// The refresh-cycle form of the FotMob incidents upgrade
     /// (RC2): same discipline as `upgradeDetails(for:)` — FotMob
     /// states only (the details endpoint is FotMob-only), capped
-    /// at 4 per pass, live first, cached ids never refetched —
-    /// driven from the store's own states because the cycle has
-    /// no channel list. Only states lacking incidents qualify.
+    /// at 4 per pass, live first — driven from the store's own
+    /// states because the cycle has no channel list. A state
+    /// qualifies when it lacks incidents and has none cached, or
+    /// (E2) when it is LIVE and its score differs from the score
+    /// its cached incidents were fetched against: before E2 a
+    /// cached id was never refetched, so a live FotMob-only
+    /// fixture's scorers froze at the first fetch while its
+    /// score moved on. Both kinds share the one cap of 4.
     private func upgradeLiveFotMobDetails() async {
         let ordered = states.sorted {
             ($0.status.isLiveish ? 0 : 1) < ($1.status.isLiveish ? 0 : 1)
@@ -1233,9 +1243,23 @@ final class MatchStateStore: ObservableObject {
         for state in ordered {
             guard targets.count < 4,
                   state.source == .fotmob,
-                  let id = state.fotmobID,
-                  state.goals.isEmpty, state.cards.isEmpty,
-                  detailCache[id] == nil else { continue }
+                  let id = state.fotmobID else { continue }
+            let firstFetch = state.goals.isEmpty && state.cards.isEmpty
+                && detailCache[id] == nil
+            let scoreMoved = state.status == .live && detailCache[id] != nil
+                && (detailScore[id].map {
+                    $0.home != state.scoreHome || $0.away != state.scoreAway
+                } ?? false)
+            guard firstFetch || scoreMoved else { continue }
+            if scoreMoved, let was = detailScore[id] {
+                func score(_ home: Int?, _ away: Int?) -> String {
+                    "\(home.map { "\($0)" } ?? "?")-\(away.map { "\($0)" } ?? "?")"
+                }
+                let from = score(was.home, was.away)
+                let to = score(state.scoreHome, state.scoreAway)
+                DiagLog.log("cluster",
+                            "fotmob details refetch: id=\(id) score \(from) -> \(to)")
+            }
             targets.append(id)
         }
         if targets.isEmpty { return }
@@ -1247,6 +1271,7 @@ final class MatchStateStore: ObservableObject {
                 where states[i].source == .fotmob && states[i].fotmobID == id {
                     states[i].goals = details.goals
                     states[i].cards = details.cards
+                    detailScore[id] = (states[i].scoreHome, states[i].scoreAway)
                     changed = true
                 }
                 if changed { revision += 1 }
@@ -1447,6 +1472,9 @@ final class MatchStateStore: ObservableObject {
                 where states[i].source == .fotmob && states[i].fotmobID == id {
                     states[i].goals = details.goals
                     states[i].cards = details.cards
+                    // E2: the score these incidents were fetched
+                    // against (read by upgradeLiveFotMobDetails).
+                    detailScore[id] = (states[i].scoreHome, states[i].scoreAway)
                     changed = true
                 }
                 if changed { revision += 1 }
