@@ -1123,11 +1123,23 @@ final class MatchStateStore: ObservableObject {
     private var loopTask: Task<Void, Never>?
     private var refreshing = false
     private var detailCache: [Int: (goals: [GoalEvent], cards: [CardEvent])] = [:]
-    /// E2 (AUDIT.md): the FotMob score a cached `detailCache`
-    /// entry was fetched against, so the refresh cycle can tell
-    /// when a LIVE match has scored (or had a goal taken back)
-    /// since its incidents were fetched, and fetch them again.
-    private var detailScore: [Int: (home: Int?, away: Int?)] = [:]
+    /// E2 (AUDIT.md): what a cached `detailCache` entry was
+    /// fetched against — the FotMob state's own score and whether
+    /// it was full-time, captured when the fetch was ISSUED (before
+    /// the await) and written in the same step as the cache entry
+    /// (`storeDetails`), so the refresh cycle can tell when a match
+    /// has scored (or had a goal taken back) or finished since its
+    /// incidents were fetched, and fetch them again.
+    private struct DetailStamp {
+        let home: Int?
+        let away: Int?
+        let atFullTime: Bool
+    }
+    private var detailStamp: [Int: DetailStamp] = [:]
+    /// Consecutive results for an id that failed the consistency
+    /// rule in `storeDetails` (bounded retry); cleared on accept.
+    private var detailRejects: [Int: Int] = [:]
+    private static let maxDetailRejects = 3
 
     func start() {
         guard loopTask == nil else { return }
@@ -1236,52 +1248,125 @@ final class MatchStateStore: ObservableObject {
     /// live FotMob-only fixture's scorers froze at the first
     /// fetch while its score moved on. Half-time and full-time
     /// are included so a goal just before the break, or after
-    /// the last live poll, is still fetched; a finished match
-    /// whose score matches fetches nothing further. Both kinds
-    /// share the one cap of 4.
+    /// the last live poll, is still fetched. A cached match also
+    /// gets ONE full-time settling fetch at its first full-time
+    /// poll when its last accepted fetch was issued before full
+    /// time, whatever the score (cards-only changes at the end).
+    /// After that, a finished match whose score matches fetches
+    /// nothing further. All kinds share the one cap of 4, re-fetches
+    /// first. The stamp is written with the cache entry
+    /// (`storeDetails`), which also holds the consistency rule.
     private func upgradeLiveFotMobDetails() async {
         let ordered = states.sorted {
             ($0.status.isLiveish ? 0 : 1) < ($1.status.isLiveish ? 0 : 1)
         }
-        var targets: [Int] = []
+        // E2 (P3): re-fetch targets fill the cap of 4 BEFORE
+        // first-fetch targets, so uncached states from the whole
+        // day's feed cannot starve them. Which states qualify as a
+        // first fetch is unchanged.
+        typealias Target = (id: Int, issued: DetailStamp, log: String?)
+        var refetches: [Target] = []
+        var firstFetches: [Target] = []
         for state in ordered {
-            guard targets.count < 4,
-                  state.source == .fotmob,
-                  let id = state.fotmobID else { continue }
-            let firstFetch = state.goals.isEmpty && state.cards.isEmpty
-                && detailCache[id] == nil
+            guard state.source == .fotmob, let id = state.fotmobID else { continue }
+            let issued = DetailStamp(home: state.scoreHome, away: state.scoreAway,
+                                     atFullTime: state.status == .fullTime)
+            guard detailCache[id] != nil else {
+                if state.goals.isEmpty && state.cards.isEmpty {
+                    firstFetches.append((id, issued, nil))
+                }
+                continue
+            }
+            let stamp = detailStamp[id]
+            // Score moved since the issued-against score, while
+            // live, half-time or full-time. A missing stamp counts
+            // as moved (fail open): a cache entry with no stamp is
+            // exactly the state that used to freeze.
             let scoreMoved = (state.status.isLiveish || state.status == .fullTime)
-                && detailCache[id] != nil
-                && (detailScore[id].map {
+                && (stamp.map {
                     $0.home != state.scoreHome || $0.away != state.scoreAway
-                } ?? false)
-            guard firstFetch || scoreMoved else { continue }
-            if scoreMoved, let was = detailScore[id] {
+                } ?? true)
+            // Full-time settling fetch: once per match, the first
+            // full-time poll after a fetch issued before full time,
+            // whatever the score (catches cards-only changes).
+            let settling = state.status == .fullTime && stamp?.atFullTime != true
+            guard scoreMoved || settling else { continue }
+            let log: String
+            if scoreMoved {
                 func score(_ home: Int?, _ away: Int?) -> String {
                     "\(home.map { "\($0)" } ?? "?")-\(away.map { "\($0)" } ?? "?")"
                 }
-                let from = score(was.home, was.away)
+                let from = score(stamp?.home, stamp?.away)
                 let to = score(state.scoreHome, state.scoreAway)
-                DiagLog.log("cluster",
-                            "fotmob details refetch: id=\(id) score \(from) -> \(to)")
+                log = "fotmob details refetch: id=\(id) score \(from) -> \(to)"
+            } else {
+                log = "fotmob details full-time settle: id=\(id)"
             }
-            targets.append(id)
+            refetches.append((id, issued, log))
         }
+        let targets = Array((refetches + firstFetches).prefix(4))
         if targets.isEmpty { return }
-        for id in targets {
+        for target in targets {
+            if let line = target.log { DiagLog.log("cluster", line) }
+        }
+        for target in targets {
+            let id = target.id
             if let details = await MatchStateClient.fetchFotMobDetails(matchID: id) {
-                detailCache[id] = details
+                storeDetails(details, for: id, issued: target.issued)
                 var changed = false
                 for i in states.indices
                 where states[i].source == .fotmob && states[i].fotmobID == id {
                     states[i].goals = details.goals
                     states[i].cards = details.cards
-                    detailScore[id] = (states[i].scoreHome, states[i].scoreAway)
                     changed = true
                 }
                 if changed { revision += 1 }
             }
         }
+    }
+
+    /// The issue-time stamp for FotMob match `id`: its own raw
+    /// FotMob state's score and status right now, or nil when the
+    /// store holds no FotMob state for it.
+    private func issueStamp(for id: Int) -> DetailStamp? {
+        guard let state = states.first(where: {
+            $0.source == .fotmob && $0.fotmobID == id
+        }) else { return nil }
+        return DetailStamp(home: state.scoreHome, away: state.scoreAway,
+                           atFullTime: state.status == .fullTime)
+    }
+
+    /// Writes one fetched details result: the cache entry and its
+    /// stamp in the same step (E2), so no path can leave a cache
+    /// entry behind without the stamp it was fetched against.
+    ///
+    /// Consistency rule (E2, P4): when the issued score is known on
+    /// both sides, the result must list at least `home + away`
+    /// goal events. A result listing fewer is still cached and
+    /// shown (as before E2), but the stamp is NOT advanced, so the
+    /// next pass fetches again. After `maxDetailRejects`
+    /// consecutive such results for the id the stamp is advanced
+    /// anyway, so a feed that never lists every goal cannot cause
+    /// a fetch on every pass forever. An unknown issued score, or a
+    /// nil `issued` (no FotMob state at issue time), cannot be
+    /// checked: the stamp is written as issued, or not at all.
+    private func storeDetails(_ details: (goals: [GoalEvent], cards: [CardEvent]),
+                              for id: Int, issued: DetailStamp?) {
+        detailCache[id] = details
+        guard let issued else { return }
+        if let home = issued.home, let away = issued.away,
+           details.goals.count < home + away {
+            let rejects = (detailRejects[id] ?? 0) + 1
+            DiagLog.log("cluster",
+                        "fotmob details lag: id=\(id) listed \(details.goals.count) "
+                        + "goal(s) for \(home)-\(away) — attempt \(rejects)/\(Self.maxDetailRejects)")
+            if rejects < Self.maxDetailRejects {
+                detailRejects[id] = rejects
+                return
+            }
+        }
+        detailRejects[id] = nil
+        detailStamp[id] = issued
     }
 
     /// The state bound to a fixture channel, if any: pair-key +
@@ -1470,16 +1555,17 @@ final class MatchStateStore: ObservableObject {
         }
         if targets.isEmpty { return }
         for id in targets {
+            // E2: the stamp is captured at issue time, before the
+            // await — `refreshing` does not cover this path, so a
+            // refresh may replace `states` while the fetch runs.
+            let issued = issueStamp(for: id)
             if let details = await MatchStateClient.fetchFotMobDetails(matchID: id) {
-                detailCache[id] = details
+                storeDetails(details, for: id, issued: issued)
                 var changed = false
                 for i in states.indices
                 where states[i].source == .fotmob && states[i].fotmobID == id {
                     states[i].goals = details.goals
                     states[i].cards = details.cards
-                    // E2: the score these incidents were fetched
-                    // against (read by upgradeLiveFotMobDetails).
-                    detailScore[id] = (states[i].scoreHome, states[i].scoreAway)
                     changed = true
                 }
                 if changed { revision += 1 }
