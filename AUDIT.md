@@ -1,5 +1,14 @@
 # AUDIT.md: Đá Banh iOS + tvOS code audit (Phase 1, report only)
 
+> **Scope correction (leader, 2026-11-23): the tvOS findings in this audit are superseded.**
+> Production tvOS is a separate repository (`dabanh-tvos`, v1.7.6, green and owner-approved), which this audit did not see. The tvOS half below measured the legacy `DaBanhTV` target inside this monorepo instead. So:
+> - **F1** (DaBanhTV does not compile) is not a shipping blocker. It stays on the list only as a low-priority monorepo cleanup and is skipped unless the leader says otherwise.
+> - **Class G** (iOS ↔ tvOS drift) was measured against the wrong tree. Its findings G1–G7 do not describe production tvOS.
+> - **The G3 pill question is withdrawn.**
+> - **No tvOS finding is to be acted on**, including the tvOS halves of C1 and E5 and the tvOS rows of F.1. The tvOS rows of F.1 still describe the legacy target's build correctly.
+>
+> Phase 2 covers the iOS findings only: H1, then E1, then E2.
+
 **Tree audited:** `zjoenguyenz/dabanh-ios-opt` `main` @ `b800b7b` (2026-11-23). Apart from the brief, this tree matches production `dabanh-ios` @ `6a8cb0d`: a `diff -rq` found only `highlights.json` different.
 **In scope:** DaBanh (iOS 1.35/36), DaBanhTV (tvOS 1.3.5/17) + DaBanhTVTopShelf, the shared core, `tools/highlight_collector.py`, `.github/workflows/build-dabanh.yml`.
 **Out of scope:** JoeTV, TV and JoeTVTopShelf, plus `build-joetv.yml`. I did not audit, build or modify these. The CI builds were dispatched as `target=ios` and `target=tvos` separately because `target=both` also builds the out-of-scope `TV` scheme.
