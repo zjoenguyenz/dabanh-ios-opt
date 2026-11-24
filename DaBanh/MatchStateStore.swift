@@ -1130,16 +1130,33 @@ final class MatchStateStore: ObservableObject {
     /// (`storeDetails`), so the refresh cycle can tell when a match
     /// has scored (or had a goal taken back) or finished since its
     /// incidents were fetched, and fetch them again.
+    ///
+    /// `home`, `away` and `atFullTime` are the issued EPISODE.
+    /// `fullTimeAccepted` counts the accepted fetches issued at
+    /// full time for this id, carried forward across stamps
+    /// (`storeDetails`); the full-time settling budget reads it.
     private struct DetailStamp {
         let home: Int?
         let away: Int?
         let atFullTime: Bool
+        var fullTimeAccepted = 0
+
+        /// Same issued score and full-time flag (the episode a
+        /// lagging result is counted against).
+        func sameEpisode(as other: DetailStamp) -> Bool {
+            home == other.home && away == other.away && atFullTime == other.atFullTime
+        }
     }
     private var detailStamp: [Int: DetailStamp] = [:]
-    /// Consecutive results for an id that failed the consistency
-    /// rule in `storeDetails` (bounded retry); cleared on accept.
-    private var detailRejects: [Int: Int] = [:]
+    /// Consecutive lagging results for an id, banked WITH the
+    /// episode (issued score + full-time flag) they were counted
+    /// against; a lagging result for a different episode restarts
+    /// the count at 1. Cleared when a result is accepted.
+    private var detailRejects: [Int: (episode: DetailStamp, count: Int)] = [:]
     private static let maxDetailRejects = 3
+    /// Accepted fetches issued at full time after which a cached
+    /// entry stops qualifying for full-time settling fetches.
+    private static let fullTimeFetchBudget = 3
 
     func start() {
         guard loopTask == nil else { return }
@@ -1248,14 +1265,17 @@ final class MatchStateStore: ObservableObject {
     /// live FotMob-only fixture's scorers froze at the first
     /// fetch while its score moved on. Half-time and full-time
     /// are included so a goal just before the break, or after
-    /// the last live poll, is still fetched. A cached match also
-    /// gets ONE full-time settling fetch at its first full-time
-    /// poll when its last accepted fetch was issued before full
-    /// time, whatever the score (cards-only changes at the end).
-    /// After that, a finished match whose score matches fetches
-    /// nothing further. All kinds share the one cap of 4, re-fetches
-    /// first. The stamp is written with the cache entry
-    /// (`storeDetails`), which also holds the consistency rule.
+    /// the last live poll, is still fetched. At full time a cached
+    /// match also keeps qualifying for a settling fetch on every
+    /// pass, whatever the score (late cards and any other late
+    /// incident), until it has had `fullTimeFetchBudget` (3)
+    /// ACCEPTED fetches issued at full time — a score-moved
+    /// full-time re-fetch counts toward the same budget, a lagging
+    /// result does not. After that, a finished match whose score
+    /// matches fetches nothing further. All kinds share the one
+    /// cap of 4, re-fetches first. The stamp is written with the
+    /// cache entry (`storeDetails`), which also holds the
+    /// consistency rule.
     private func upgradeLiveFotMobDetails() async {
         let ordered = states.sorted {
             ($0.status.isLiveish ? 0 : 1) < ($1.status.isLiveish ? 0 : 1)
@@ -1286,10 +1306,13 @@ final class MatchStateStore: ObservableObject {
                 && (stamp.map {
                     $0.home != state.scoreHome || $0.away != state.scoreAway
                 } ?? true)
-            // Full-time settling fetch: once per match, the first
-            // full-time poll after a fetch issued before full time,
-            // whatever the score (catches cards-only changes).
-            let settling = state.status == .fullTime && stamp?.atFullTime != true
+            // Full-time settling fetch: at every full-time pass,
+            // whatever the score (late cards and other incidents),
+            // until 3 fetches issued at full time have been ACCEPTED
+            // (stored with an advanced stamp) for this id.
+            let fullTimeAccepted = stamp?.fullTimeAccepted ?? 0
+            let settling = state.status == .fullTime
+                && fullTimeAccepted < Self.fullTimeFetchBudget
             guard scoreMoved || settling else { continue }
             let log: String
             if scoreMoved {
@@ -1300,7 +1323,8 @@ final class MatchStateStore: ObservableObject {
                 let to = score(state.scoreHome, state.scoreAway)
                 log = "fotmob details refetch: id=\(id) score \(from) -> \(to)"
             } else {
-                log = "fotmob details full-time settle: id=\(id)"
+                log = "fotmob details full-time settle: id=\(id) "
+                    + "accepted \(fullTimeAccepted)/\(Self.fullTimeFetchBudget)"
             }
             refetches.append((id, issued, log))
         }
@@ -1336,37 +1360,58 @@ final class MatchStateStore: ObservableObject {
                            atFullTime: state.status == .fullTime)
     }
 
-    /// Writes one fetched details result: the cache entry and its
-    /// stamp in the same step (E2), so no path can leave a cache
-    /// entry behind without the stamp it was fetched against.
+    /// Writes one fetched details result (E2). Every fetch path
+    /// stores through here, and the stamp is written in the same
+    /// step as the cache entry — with two deliberate exceptions
+    /// that leave the stamp behind the cache: a nil `issued` (no
+    /// FotMob state at issue time) writes the cache with NO stamp,
+    /// and a lagging result (below) keeps the previous stamp. Both
+    /// are re-fetched by `upgradeLiveFotMobDetails`: a missing
+    /// stamp counts as a moved score (fail open), and a kept stamp
+    /// still differs from the current score or still has budget.
     ///
     /// Consistency rule (E2, P4): when the issued score is known on
     /// both sides, the result must list at least `home + away`
     /// goal events. A result listing fewer is still cached and
     /// shown (as before E2), but the stamp is NOT advanced, so the
-    /// next pass fetches again. After `maxDetailRejects`
-    /// consecutive such results for the id the stamp is advanced
-    /// anyway, so a feed that never lists every goal cannot cause
-    /// a fetch on every pass forever. An unknown issued score, or a
-    /// nil `issued` (no FotMob state at issue time), cannot be
-    /// checked: the stamp is written as issued, or not at all.
+    /// next pass fetches again. Lagging results are counted per
+    /// EPISODE — the issued score and full-time flag: a lagging
+    /// result for the same episode as the banked one adds 1, a
+    /// lagging result for any other episode restarts the count at
+    /// 1. On the `maxDetailRejects`-th (3rd) consecutive lagging
+    /// result for the same episode the stamp is advanced anyway,
+    /// so a feed that never lists every goal cannot cause a fetch
+    /// on every pass forever. An unknown issued score cannot be
+    /// checked: the stamp is written as issued.
+    ///
+    /// An accepted stamp carries `fullTimeAccepted` forward from
+    /// the previous stamp, plus 1 when this fetch was issued at
+    /// full time (the full-time settling budget).
     private func storeDetails(_ details: (goals: [GoalEvent], cards: [CardEvent]),
                               for id: Int, issued: DetailStamp?) {
         detailCache[id] = details
         guard let issued else { return }
         if let home = issued.home, let away = issued.away,
            details.goals.count < home + away {
-            let rejects = (detailRejects[id] ?? 0) + 1
+            let rejects: Int
+            if let banked = detailRejects[id], banked.episode.sameEpisode(as: issued) {
+                rejects = banked.count + 1
+            } else {
+                rejects = 1
+            }
             DiagLog.log("cluster",
                         "fotmob details lag: id=\(id) listed \(details.goals.count) "
                         + "goal(s) for \(home)-\(away) — attempt \(rejects)/\(Self.maxDetailRejects)")
             if rejects < Self.maxDetailRejects {
-                detailRejects[id] = rejects
+                detailRejects[id] = (issued, rejects)
                 return
             }
         }
         detailRejects[id] = nil
-        detailStamp[id] = issued
+        var stamp = issued
+        stamp.fullTimeAccepted = (detailStamp[id]?.fullTimeAccepted ?? 0)
+            + (issued.atFullTime ? 1 : 0)
+        detailStamp[id] = stamp
     }
 
     /// The state bound to a fixture channel, if any: pair-key +
