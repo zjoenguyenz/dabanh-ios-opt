@@ -3,7 +3,7 @@
 **Tree audited:** `zjoenguyenz/dabanh-ios-opt` `main` @ `b800b7b` (2026-11-23). Apart from the brief, this tree matches production `dabanh-ios` @ `6a8cb0d`: a `diff -rq` found only `highlights.json` different.
 **In scope:** DaBanh (iOS 1.35/36), DaBanhTV (tvOS 1.3.5/17) + DaBanhTVTopShelf, the shared core, `tools/highlight_collector.py`, `.github/workflows/build-dabanh.yml`.
 **Out of scope:** JoeTV, TV and JoeTVTopShelf, plus `build-joetv.yml`. I did not audit, build or modify these. The CI builds were dispatched as `target=ios` and `target=tvos` separately because `target=both` also builds the out-of-scope `TV` scheme.
-**No code was changed.** The only repository writes are this file and two throwaway refs used to get class F evidence (see §F.0). Both refs are deleted after this commit.
+**No code was changed.** The only repository writes are this file and two throwaway refs used to get class F evidence (see §F.0): `audit/tvos-last-green` (points at the existing commit `0859de6`, no new commit) and `audit/ipa-dissect` (one commit adding only the dissect workflow). Neither touches `main`. This session's git access was refused a delete (HTTP 403), so **both refs still exist and should be deleted by the owner**. Their run logs stay on GitHub either way.
 
 ### Evidence labels
 
@@ -68,7 +68,7 @@ Impact and fix risk are scored 1–5 (5 = worst outage or riskiest fix). The ran
 | [45293267416](https://github.com/zjoenguyenz/dabanh-ios-opt/actions/runs/45293267416) | `build-dabanh.yml`, `target=tvos`, ref `audit/tvos-last-green` = `0859de6` (iOS 1.20, the newest commit whose shared core still compiles for tvOS) | **success** · artifact `DaBanhTV-ipa-run3-20261123` |
 | [45293956534](https://github.com/zjoenguyenz/dabanh-ios-opt/actions/runs/45293956534) | Throwaway `audit-ipa-dissect.yml` on branch `audit/ipa-dissect`. It downloads the two artifacts above by run id, unzips them, and prints `PlistBuddy` keys and the Mach-O `LC_BUILD_VERSION` (`otool -l`). It does not build anything. | **success**: values below |
 
-The tvOS IPA had to come from `0859de6` because HEAD cannot build. The DaBanhTV and DaBanhTVTopShelf target settings (deployment target, SDK selection, Info.plist pairs) are the same at `0859de6` and HEAD: `git diff 0859de6 origin/main -- project.yml` touches only the iOS target. The workflow is also the same (`latest-stable` on `macos-latest`). So the DT/Min values carry over to any HEAD tvOS build once F1 is fixed, as long as the runner keeps the same Xcode. The dissect workflow's source is in Appendix A. Both audit refs are deleted after this commit; GitHub keeps the run logs.
+The tvOS IPA had to come from `0859de6` because HEAD cannot build. The DaBanhTV and DaBanhTVTopShelf target settings (deployment target, SDK selection, Info.plist pairs) are the same at `0859de6` and HEAD: `git diff 0859de6 origin/main -- project.yml` touches only the iOS target. The workflow is also the same (`latest-stable` on `macos-latest`). So the DT/Min values carry over to any HEAD tvOS build once F1 is fixed, as long as the runner keeps the same Xcode. The dissect workflow's source is in Appendix A. The two audit refs could not be deleted from this session (HTTP 403); GitHub keeps the run logs after they are deleted.
 
 ### F.1 Dissected values
 
@@ -469,7 +469,7 @@ There is no device or profiler here, so every timing below is **UNMEASURED**. Ca
 
 ---
 
-## Appendix A: the throwaway dissection workflow (branch `audit/ipa-dissect`, deleted after the audit)
+## Appendix A: the throwaway dissection workflow (branch `audit/ipa-dissect`; owner to delete)
 
 ```yaml
 name: AUDIT — dissect DaBanh IPAs (throwaway, Phase 1 evidence)
