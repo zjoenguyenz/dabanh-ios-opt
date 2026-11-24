@@ -1230,11 +1230,15 @@ final class MatchStateStore: ObservableObject {
     /// at 4 per pass, live first — driven from the store's own
     /// states because the cycle has no channel list. A state
     /// qualifies when it lacks incidents and has none cached, or
-    /// (E2) when it is LIVE and its score differs from the score
-    /// its cached incidents were fetched against: before E2 a
-    /// cached id was never refetched, so a live FotMob-only
-    /// fixture's scorers froze at the first fetch while its
-    /// score moved on. Both kinds share the one cap of 4.
+    /// (E2) when it is live, half-time or full-time and its score
+    /// differs from the score its cached incidents were fetched
+    /// against: before E2 a cached id was never refetched, so a
+    /// live FotMob-only fixture's scorers froze at the first
+    /// fetch while its score moved on. Half-time and full-time
+    /// are included so a goal just before the break, or after
+    /// the last live poll, is still fetched; a finished match
+    /// whose score matches fetches nothing further. Both kinds
+    /// share the one cap of 4.
     private func upgradeLiveFotMobDetails() async {
         let ordered = states.sorted {
             ($0.status.isLiveish ? 0 : 1) < ($1.status.isLiveish ? 0 : 1)
@@ -1246,7 +1250,8 @@ final class MatchStateStore: ObservableObject {
                   let id = state.fotmobID else { continue }
             let firstFetch = state.goals.isEmpty && state.cards.isEmpty
                 && detailCache[id] == nil
-            let scoreMoved = state.status == .live && detailCache[id] != nil
+            let scoreMoved = (state.status.isLiveish || state.status == .fullTime)
+                && detailCache[id] != nil
                 && (detailScore[id].map {
                     $0.home != state.scoreHome || $0.away != state.scoreAway
                 } ?? false)
