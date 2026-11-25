@@ -6,6 +6,8 @@
   - R2 = the commit that adds this file.
 - **Device status:** nothing here has been run on a device. Every acceptance item still has to be measured (see the checks at the end).
 
+R2.1 change (C-R2-1): the one retry now covers the board route as well as the close. Before, it was close-only. Its discipline is unchanged.
+
 R2 changes:
 - Finding 1: the turn clock is now time-continuous.
 - Finding 2: the after-exit path is decided at the settle only.
@@ -135,11 +137,13 @@ See Findings 2 and 3.
 | Portrait, hosting home | Run the close or board action. |
 | Landscape, a toggle serviced in this settle | That toggle is the exit. Record it as issued. |
 | Landscape, no exit issued yet (a tap mid-turn) | Issue the first exit. This is **not** the retry. |
-| Landscape, the transition began **after** the issued exit | The exit's landing failed: spend the **one** retry. |
+| Landscape, the transition began **after** the issued exit | The exit's landing failed: spend the **one** retry. This applies whichever action is waiting: close, board or both (C-R2-1). |
 | Landscape, the transition began before the exit | Wait for the exit's own turn. |
 
 - The dismissal completion now calls `completeMUAfterExitAtHostingHome()`. That function can only *finish* an action a portrait settle has already approved and parked (`afterExitAwaitingHosting`). It never decides, never issues an exit and never touches the retry.
 - The completion clears the hosting records (`presentedController = nil`) before making this call, so the check sees the hosting as home.
+
+**C-R2-1 (R2.1).** In R2 the retry was also guarded by `afterExitClose`. A board-only request whose exit landed in landscape therefore got no retry: it went to the 1 s fallback and opened the board in landscape. That guard is removed. The retry is now spent for any waiting action, still exactly once (`afterExitRetried`), and still only behind `lastSettledArmedAt > afterExitIssuedAt`. Its log line is now `after-exit: the exit's landing settled on the landscape page — the one retry (close=… board=…)`.
 
 **Why the invariant holds.**
 - The retry is written in exactly one place, behind `lastSettledArmedAt > afterExitIssuedAt`. That condition is true only for a transition that began after the exit was issued and still landed in landscape, which is a genuinely failed landing.
@@ -207,5 +211,5 @@ See Findings 2 and 3.
 3. **High-speed capture:** ≤9 frames, footprint vs. angle, per-frame scale ≤15%.
 4. **Exit growth:** if it survives D2, I need a trace of `videoView.layer.presentation()` and of the host slot.
 5. **Close matrix:** run every route in the table above. Each must have zero `orientation geometry update rejected` lines, and the board must appear in portrait. These lines mean that run failed: `1 s fallback`, `requesting anyway`.
-6. **Retry (Finding 2):** a close tapped during an enter turn should log `exit issued (landscape settle after a mid-turn request)`, not `the one retry`.
+6. **Retry (Finding 2, C-R2-1):** a close tapped during an enter turn should log `exit issued (landscape settle after a mid-turn request)`, not `the one retry`. If a board-tap exit lands in landscape, it should log `the one retry (close=false board=true)`, and the board must then open in portrait. The 1 s fallback should not fire.
 7. **Regression:** chip switch while in fullscreen (D8), failover, quality/audio sheets, PiP, and pixel comparison of both settled pages.

@@ -1343,11 +1343,15 @@ extension LivePlayerViewController {
             return
         }
         if mu.lastSettledArmedAt > mu.afterExitIssuedAt {
-            if mu.afterExitClose, !mu.afterExitRetried {
+            // C-R2-1: the retry covers BOTH waiting actions
+            // — a failed exit landing is the same event
+            // whether a close or the board is waiting.
+            if !mu.afterExitRetried {
                 mu.afterExitRetried = true
                 DiagLog.log("player",
-                            "close: the exit's landing settled on the landscape page "
-                            + "— the one retry")
+                            "after-exit: the exit's landing settled on the landscape page "
+                            + "— the one retry (close=\(mu.afterExitClose) "
+                            + "board=\(mu.openBoardAfterExit))")
                 issueMUAfterExitExit(mu, why: "retry")
             }
             return
