@@ -38,6 +38,32 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
 /// Sets the orientation lock and, when a rotation target is given, asks
 /// the active scene to rotate to it (iOS 16+ geometry update; the app
 /// targets iOS 17).
+///
+/// FIX-137 (DB-30/FL-402): the geometry update must request the
+/// TARGET orientation itself — a mask holding only that one
+/// orientation — not the allowed `mask`. The pre-fix code passed
+/// `mask`, so `lock(.all, rotateTo: .portrait)` asked the scene to
+/// rotate to ".all", which forces nothing: after the player closed
+/// the window simply stayed in landscape. The mask for one
+/// orientation is `1 << orientation.rawValue` (the documented
+/// correspondence: portrait = 2, portraitUpsideDown = 4,
+/// landscapeRight = 8, landscapeLeft = 16). Every call is written
+/// to the diagnostic log (category "player") — before this fix the
+/// orientation path logged nothing at all, so the on-device lock
+/// sequence was unobservable.
+///
+/// FIX-139: the supported-orientations set must be updated
+/// BEFORE the geometry request (Apple TN3192). The pre-fix
+/// code called `requestGeometryUpdate` first and
+/// `setNeedsUpdateOfSupportedInterfaceOrientations()` only
+/// afterwards, so at player exit the system still held the
+/// `.landscape` supported set and the FIX-137 portrait-only
+/// geometry request was rejected. That rejection was also
+/// invisible: no `errorHandler` was passed, so the failure
+/// left no trace in the log. The set update now runs first
+/// (and still runs when no rotation target is given, for a
+/// mask-only change), and an `errorHandler` writes any
+/// rejection to the diagnostic log (category "player").
 @MainActor
 enum OrientationHelper {
     static func lock(_ mask: UIInterfaceOrientationMask,
@@ -48,13 +74,27 @@ enum OrientationHelper {
             .first(where: { $0.activationState == .foregroundActive })
             ?? UIApplication.shared.connectedScenes
                 .compactMap({ $0 as? UIWindowScene }).first
-        else { return }
-        if orientation != nil {
-            scene.requestGeometryUpdate(
-                UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: mask)
-            )
+        else {
+            DiagLog.log("player",
+                        "orientation lock: mask=\(mask.rawValue) "
+                        + "rotateTo=\(orientation?.rawValue ?? -1) — no window scene")
+            return
         }
         scene.keyWindow?.rootViewController?
             .setNeedsUpdateOfSupportedInterfaceOrientations()
+        if let orientation, orientation != .unknown {
+            let target = UIInterfaceOrientationMask(
+                rawValue: 1 << UInt(orientation.rawValue))
+            scene.requestGeometryUpdate(
+                UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: target)
+            ) { error in
+                DiagLog.log("player",
+                            "orientation geometry update rejected: \(error)")
+            }
+        }
+        DiagLog.log("player",
+                    "orientation lock: mask=\(mask.rawValue) "
+                    + "rotateTo=\(orientation?.rawValue ?? -1) "
+                    + "now=\(scene.interfaceOrientation.rawValue)")
     }
 }

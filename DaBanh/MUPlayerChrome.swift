@@ -113,6 +113,101 @@ final class MUChromeViews {
     /// (FIX-MU-3, finding 9): chip font is 11 portrait /
     /// 10 landscape, so a rotation rebuilds the chips.
     var landscape = false
+    /// FIX-141: a rotation transition (viewWillTransition)
+    /// is in flight for this chrome. Set by the view
+    /// controller's transition override in PlayerView.swift,
+    /// read by muToggleFullscreen, and cleared in the
+    /// transition's completion. FIX-142: the completion
+    /// now does bookkeeping only (the settle layout pass
+    /// is deleted), and a toggle fired mid-transition is
+    /// no longer dropped — it flips pendingToggle below.
+    var transitionInFlight = false
+    /// FIX-142: the pending-toggle parity bit. A
+    /// fullscreen toggle fired while a rotation
+    /// transition is in flight flips this bit instead of
+    /// being dropped (FIX-141's coalescing ate genuine
+    /// taps, DIAG-142); when the transition settles, the
+    /// completion runs ONE fresh toggle if the bit is
+    /// set. Two mid-flight taps cancel out (parity, not
+    /// a counter), so geometry requests never stack
+    /// (DIAG-140's disease) and no tap is ever eaten.
+    var pendingToggle = false
+    /// FIX-141: the last (page, size) pair layoutMUChrome
+    /// wrote to DiagLog — layout passes log only when the
+    /// chosen page or the size used changes, so the strip
+    /// class (DIAG-140 §4.4) becomes observable without a
+    /// line per pass.
+    var lastLoggedLayoutPage: String?
+    var lastLoggedLayoutSize: CGSize?
+    /// FIX-143: the orientation the PRESENTATION layer
+    /// (fonts + kern, chip spacing + rebuild, scrim /
+    /// footer / source-label visibility) was last applied
+    /// for — true = landscape, false = portrait, nil =
+    /// never applied. While a rotation transition is in
+    /// flight the presentation is DEFERRED (the elements
+    /// ride the turn at their old presentation — DIAG-143
+    /// Option B); finishMURotation applies it at settle,
+    /// where this flag is compared against the settled
+    /// page. Deliberately separate from `landscape` above:
+    /// that flag is the GEOMETRY page and follows the live
+    /// bounds on every pass, in flight or not.
+    var presentationLandscape: Bool?
+    /// FIX-143: a chip rebuild was requested while a
+    /// transition was in flight (a content refresh) and
+    /// deferred — chips are never rebuilt mid-flight
+    /// (DIAG-143 §2.3); the settle presentation honours
+    /// this bit even when the page itself did not change.
+    var chipsDirty = false
+    /// FIX-143 (§3.1): layout passes counted while a
+    /// transition is in flight — reset by
+    /// viewWillTransition, incremented per in-flight pass
+    /// by layoutMUChrome; the per-pass in-flight log line
+    /// carries the count as its pass index.
+    var inFlightPassCount = 0
+    /// FIX-144 (Option A): the fullscreen presentation's
+    /// scratch state for THIS surface — where the player
+    /// view lived in the SwiftUI host before it was moved
+    /// into the presented fullscreen controller, so the
+    /// dismissal can restore it exactly (KSPlayer's
+    /// originalSuperView / originalFrame pair; the view
+    /// is frame-based in the host, so there are no
+    /// constraints to save — SwiftUI owns that layout and
+    /// re-asserts it on its next pass regardless).
+    weak var hostOriginalSuperview: UIView?
+    var hostOriginalIndex = 0
+    var hostOriginalFrame: CGRect = .zero
+    /// FIX-144 gate Round 1 (F-A3): the view's
+    /// autoresizing mask in the host slot — ENTER sets
+    /// the flexible mask the fullscreen fill needs, so
+    /// the slot's own mask is part of what the dismissal
+    /// (and the present-refusal rollback) restores.
+    var hostOriginalAutoresizingMask: UIView.AutoresizingMask = []
+    /// FIX-144 gate Round 1 (B-4): teardown landed
+    /// while THIS surface's own present/dismiss was
+    /// still in flight — the release is deferred, not
+    /// executed against the in-flight call, and the
+    /// call's completion resolves it (see
+    /// releaseMUFullscreenHostingForTeardown).
+    var releasePendingAfterFlight = false
+    /// FIX-145: a present/dismiss of THIS surface's
+    /// fullscreen hosting is in flight. This flag guards
+    /// ONLY the hosting bookkeeping — the teardown
+    /// release defers to the in-flight call's completion
+    /// while it is set. It does NOT touch the rotation
+    /// path: the turn belongs to the window's transition
+    /// coordinator alone (the FIX-143 path, restored by
+    /// FIX-145 — the FIX-144 experiment that let the
+    /// presentation drive the turn crashed on device,
+    /// DIAG-145).
+    var hostingTransitionInFlight = false
+    /// FIX-144: "Tất cả nguồn" was tapped while the
+    /// fullscreen presentation was up — the SwiftUI
+    /// board sheet stacks on the cover, UNDER the
+    /// presentation, so the tap exits fullscreen first
+    /// and the dismissal's completion opens the board
+    /// once the player view is home. A fresh enter
+    /// (a parity-serviced toggle) cancels the request.
+    var openBoardAfterExit = false
     let scrimTop = UIView()
     let scrimBottom = UIView()
     var chipButtons: [UIButton] = []
@@ -135,6 +230,60 @@ final class MUChromeViews {
 @MainActor
 enum MUFullscreenState {
     static var isActive = false
+    /// FIX-144 (Option A): the live fullscreen
+    /// presentation, if one is up — the controller the
+    /// toggle's ENTER decision presented and the EXIT
+    /// decision dismisses, and the controller a successor
+    /// surface (an in-place source swap replaces the
+    /// player VC wholesale) adopts instead of presenting
+    /// a second one. Weak: the presentation itself keeps
+    /// the controller alive; these records must never
+    /// resurrect a dead one.
+    static weak var presentedController: MUFullscreenViewController?
+    /// FIX-144: the surface currently hosted inside the
+    /// presented controller — identity-checked by the
+    /// teardown release and the successor adoption, so
+    /// the two are order-independent.
+    static weak var hostedController: LivePlayerViewController?
+}
+
+/// FIX-144 (Option A): the presented fullscreen
+/// controller — KSPlayer's PlayerFullScreenViewController
+/// mapped onto this app. It is a stable fullscreen
+/// CONTAINER for the whole existing player view: the
+/// view is moved into it on enter and restored home on
+/// exit, so source swaps, sheets and PiP all happen
+/// against one unchanging landscape surface. It is
+/// presented and dismissed WITHOUT animation and with
+/// no custom transition (FIX-145, DIAG-145): the
+/// interface rotation itself stays with the window —
+/// the FIX-139 scene geometry update is the single
+/// rotation driver, exactly as in 1.43. It returns
+/// `.all` for its supported orientations — KSPlayer's
+/// original architecture, restored by FIX-146
+/// (DIAG-146): the scene judges every geometry
+/// request against the TOPMOST presented controller,
+/// so this controller must never narrow the set — a
+/// `.landscape` declaration vetoed the app's own
+/// exit request (the 1.45 Code=101 rejections),
+/// because the FIX-139 lock fires before the
+/// dismissal while this controller is still on top.
+/// The narrowing while hosted is carried entirely
+/// by the app-wide mask (AppDelegate.orientationLock,
+/// asserted by OrientationHelper.lock), exactly as
+/// KSPlayer's global carries it; shouldAutorotate
+/// stays false, so physical rotation never moves
+/// the window while hosted.
+final class MUFullscreenViewController: UIViewController {
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+    }
+
+    override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .all }
+    override var shouldAutorotate: Bool { false }
+    override var prefersHomeIndicatorAutoHidden: Bool { true }
+    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 }
 
 /// The Manchester United player chrome (theme-mu): the
@@ -579,6 +728,17 @@ extension LivePlayerViewController {
     /// state (maroon fill, gold border, check).
     private func rebuildMUChips() {
         guard let mu = muChrome else { return }
+        // FIX-143 (§2.3): chips are NEVER rebuilt while a
+        // rotation transition is in flight — the rebuild
+        // destroys and recreates every chip button, the
+        // single most violent mid-turn swap DIAG-143
+        // convicted. A rebuild requested mid-flight (a
+        // content refresh) is deferred via chipsDirty and
+        // lands in finishMURotation's settle presentation.
+        if mu.transitionInFlight {
+            mu.chipsDirty = true
+            return
+        }
         for button in mu.chipButtons {
             mu.chipsStack.removeArrangedSubview(button)
             button.removeFromSuperview()
@@ -637,23 +797,61 @@ extension LivePlayerViewController {
     /// video block; landscape: full-bleed) — viewDidLayoutSubviews
     /// routes here whenever the MU chrome is active, so a
     /// rotation reflows between the two pages live.
+    ///
+    /// FIX-142: this again computes from the view's LIVE
+    /// bounds — the single pre-FIX-141 authority. The
+    /// FIX-141 target-size variant (an explicit size
+    /// parameter, fed by viewWillTransition's alongside
+    /// block) was convicted in DIAG-142 of fighting the
+    /// live-bounds passes the system drives during its
+    /// rotation animation; it is deleted outright, not
+    /// kept as an option — one layout authority, keyed
+    /// to live bounds. The geometry below is byte-for-byte
+    /// the former body: the old no-arg form fed it exactly
+    /// this bounds (origin .zero, the view's live size).
+    ///
+    /// FIX-143 (Option B): the pass is now TWO layers.
+    /// GEOMETRY (the page functions: frames from bounds)
+    /// runs on every pass, as always. PRESENTATION (page
+    /// fonts + kern rebuild, chip spacing + rebuild,
+    /// scrim / footer / source-label visibility —
+    /// applyMUPresentation) applies immediately on passes
+    /// outside a transition, exactly as in 1.42, but is
+    /// DEFERRED while a rotation transition is in flight:
+    /// in 1.42 those writes fired inside the flip pass as
+    /// model-layer writes outside any animation block, so
+    /// the new page's composition teleported in mid-turn
+    /// while the canvas was still rotating (DIAG-143's
+    /// conviction — the rotation was two motions, not
+    /// one). Deferred, the elements ride the turn at
+    /// their old presentation and update once, at rest,
+    /// in finishMURotation's settle pass.
     func layoutMUChrome() {
         guard let mu = muChrome else { return }
-        let bounds = view.bounds
+        let bounds = CGRect(origin: .zero, size: view.bounds.size)
         let safe = view.safeAreaInsets
-        // FIX-MU-3 (finding 9): the chip font differs per
-        // orientation — when a rotation flips the page,
-        // rebuild the chips so they pick up the new size.
         let isLandscape = bounds.width > bounds.height
+        // FIX-141: layout observability — one DiagLog line
+        // when the chosen page or the size used changes
+        // versus the last logged pair (see MUChromeViews).
+        let page = isLandscape ? "landscape" : "portrait"
+        if mu.lastLoggedLayoutPage != page
+            || mu.lastLoggedLayoutSize != bounds.size {
+            mu.lastLoggedLayoutPage = page
+            mu.lastLoggedLayoutSize = bounds.size
+            DiagLog.log("player",
+                        "mu layout: page=\(page) "
+                        + "size=\(Int(bounds.width.rounded()))x\(Int(bounds.height.rounded()))")
+        }
+        // The GEOMETRY page flag follows the live bounds on
+        // every pass, in flight or not (the FIX-139 toggle
+        // decision reads this flag — its timing is part of
+        // that proven path and does not change).
         if mu.landscape != isLandscape {
             mu.landscape = isLandscape
-            // FIX-133 (audit D17): the landscape page's chip
-            // gap is the spec's 12; portrait keeps 8. Set
-            // here, on the flip, so layoutChips' width
-            // accounting (which reads the stack spacing)
-            // always agrees with the stack itself.
-            mu.chipsStack.spacing = isLandscape ? 12 : 8
-            rebuildMUChips()
+        }
+        if !mu.transitionInFlight {
+            applyMUPresentation(mu, isLandscape: isLandscape)
         }
         if bounds.height >= bounds.width {
             layoutMUPortrait(mu, bounds: bounds, safe: safe)
@@ -661,21 +859,128 @@ extension LivePlayerViewController {
             layoutMULandscape(mu, bounds: bounds, safe: safe)
         }
         spinner.center = CGPoint(x: videoView.frame.midX, y: videoView.frame.midY)
+        // FIX-143 (§3.1/§3.2): while a transition is in
+        // flight, EVERY pass logs — no dedupe — carrying
+        // the pass index, the live bounds, the safe-area
+        // insets THIS pass saw (the B-5 inset-phase suspect
+        // becomes decidable), the chosen page and the
+        // picture's own frame; the first in-flight pass
+        // also logs the layer line.
+        if mu.transitionInFlight {
+            mu.inFlightPassCount += 1
+            DiagLog.log("player",
+                        "mu layout (in flight #\(mu.inFlightPassCount)): page=\(page) "
+                        + "bounds=\(muFmtRect(bounds)) "
+                        + "safe=\(muFmtInsets(safe)) "
+                        + "video=\(muFmtRect(videoView.frame))")
+            if mu.inFlightPassCount == 1 {
+                logMULayerLine(context: "first in-flight pass")
+            }
+        }
+    }
+
+    /// FIX-143: the PRESENTATION layer of the MU pages —
+    /// page fonts + the title's kern rebuild, the chips'
+    /// spacing + rebuild, and the scrim / footer /
+    /// source-label visibility. Split out of the page
+    /// functions (where 1.42 interleaved these writes with
+    /// the frame math) so a rotation transition can defer
+    /// them to the settle: layoutMUChrome calls this on
+    /// every pass outside a transition, and
+    /// finishMURotation's settle pass calls it (through
+    /// layoutMUChrome) once the turn has landed. The
+    /// writes are exactly 1.42's, in 1.42's values — the
+    /// settled pages do not change; only their timing
+    /// during a turn does. (layoutMiniScore's font writes
+    /// stay in the geometry layer deliberately: its font
+    /// size is 11 on BOTH pages, so those writes are
+    /// value-identical across the flip and cannot
+    /// teleport; its frames depend on the intrinsic sizes
+    /// those fonts produce, in the same pass.)
+    private func applyMUPresentation(_ mu: MUChromeViews, isLandscape: Bool) {
+        if isLandscape {
+            mu.scrimTop.isHidden = false
+            mu.scrimBottom.isHidden = false
+            mu.footerLabel.isHidden = true
+            mu.sourceLabel.isHidden = true
+            mu.nameLabel.font = MUFont.uiBody(14, .semibold)
+            mu.noteLabel.font = MUFont.uiBody(9)
+            mu.titleLabel.font = MUFont.uiDisplay(25)
+            applyMUKern(mu.titleLabel, factor: -0.015)
+            mu.statusLabel.font = MUFont.uiBody(9)
+        } else {
+            mu.scrimTop.isHidden = true
+            mu.scrimBottom.isHidden = true
+            mu.footerLabel.isHidden = false
+            mu.sourceLabel.isHidden = false
+            mu.nameLabel.font = MUFont.uiBody(17, .semibold)
+            mu.noteLabel.font = MUFont.uiBody(10)
+            mu.titleLabel.font = MUFont.uiDisplay(32)
+            applyMUKern(mu.titleLabel, factor: -0.015)
+            // 1.42's portrait page never wrote
+            // statusLabel.font (frame only) — preserved.
+        }
+        // Chips: the spacing + rebuild land only when the
+        // applied presentation's orientation changes, or
+        // when a rebuild was deferred mid-flight. (FIX-MU-3
+        // finding 9: the chip font differs per orientation,
+        // 11 portrait / 10 landscape — makeMUChip reads the
+        // geometry flag, which layoutMUChrome has already
+        // set to this same page. FIX-133 D17: the spacing
+        // is set with the rebuild so layoutChips' width
+        // accounting always agrees with the stack itself.)
+        if mu.presentationLandscape != isLandscape || mu.chipsDirty {
+            mu.presentationLandscape = isLandscape
+            mu.chipsStack.spacing = isLandscape ? 12 : 8
+            rebuildMUChips()
+            mu.chipsDirty = false
+        }
+    }
+
+    /// FIX-143 (§3.2): the picture layer's own numbers —
+    /// videoView.frame, its backing player layer's frame
+    /// (PlayerLayerView's layer IS the AVPlayerLayer, so
+    /// the two must track) and the video gravity — logged
+    /// at the fullscreen toggle, at the first in-flight
+    /// layout pass and at the settle, so the picture's
+    /// geometry is observable DURING a transition for the
+    /// first time (in 1.42 nothing logged it at all).
+    func logMULayerLine(context: String) {
+        let layer = videoView.playerLayer
+        DiagLog.log("player",
+                    "mu layer (\(context)): video=\(muFmtRect(videoView.frame)) "
+                    + "layer=\(muFmtRect(layer.frame)) "
+                    + "videorect=\(muFmtRect(layer.videoRect)) "
+                    + "gravity=\(layer.videoGravity.rawValue)")
+    }
+
+    /// Compact rect spelling for the FIX-143 log lines:
+    /// "x,y WxH", points rounded.
+    func muFmtRect(_ rect: CGRect) -> String {
+        "\(Int(rect.origin.x.rounded())),\(Int(rect.origin.y.rounded())) "
+            + "\(Int(rect.width.rounded()))x\(Int(rect.height.rounded()))"
+    }
+
+    /// Compact insets spelling for the FIX-143 log lines:
+    /// "top,left,bottom,right", points rounded.
+    func muFmtInsets(_ insets: UIEdgeInsets) -> String {
+        "\(Int(insets.top.rounded())),\(Int(insets.left.rounded())),"
+            + "\(Int(insets.bottom.rounded())),\(Int(insets.right.rounded()))"
     }
 
     private func layoutMUPortrait(_ mu: MUChromeViews, bounds: CGRect, safe: UIEdgeInsets) {
-        mu.scrimTop.isHidden = true
-        mu.scrimBottom.isHidden = true
-        mu.footerLabel.isHidden = false
+        // FIX-143: GEOMETRY ONLY — the scrim/footer
+        // visibility and the header fonts this function
+        // used to write live in applyMUPresentation now,
+        // so a rotation transition can defer them to the
+        // settle instead of teleporting them mid-turn.
         let w = bounds.width
         let pad: CGFloat = 16
         let top = safe.top
 
         // Header row (56): name + note left, close top-right.
         mu.nameLabel.frame = CGRect(x: pad, y: top + 4, width: w - pad - 48 - 24, height: 22)
-        mu.nameLabel.font = MUFont.uiBody(17, .semibold)
         mu.noteLabel.frame = CGRect(x: pad, y: top + 28, width: w - pad - 48 - 24, height: 14)
-        mu.noteLabel.font = MUFont.uiBody(10)
         closeButton.frame = CGRect(x: w - pad - 48, y: top + 4, width: 48, height: 48)
 
         // Mini-score chip under the header (absent for a
@@ -730,8 +1035,6 @@ extension LivePlayerViewController {
         layoutEyebrowRow(mu, x: pad, y: y, width: w - pad * 2, titleSize: 32)
         y += 20 + 9 * gapScale
         mu.titleLabel.frame = CGRect(x: pad, y: y, width: w - pad * 2, height: 40)
-        mu.titleLabel.font = MUFont.uiDisplay(32)
-        applyMUKern(mu.titleLabel, factor: -0.015)
         y += 40 + 8 * gapScale
         mu.statusLabel.frame = CGRect(x: pad, y: y, width: w - pad * 2, height: 15)
         y += 15 + 12 * gapScale
@@ -753,10 +1056,10 @@ extension LivePlayerViewController {
     }
 
     private func layoutMULandscape(_ mu: MUChromeViews, bounds: CGRect, safe: UIEdgeInsets) {
-        mu.scrimTop.isHidden = false
-        mu.scrimBottom.isHidden = false
-        // Spec: no portrait footer in the landscape page.
-        mu.footerLabel.isHidden = true
+        // FIX-143: GEOMETRY ONLY — the scrim/footer
+        // visibility and the page fonts this function used
+        // to write live in applyMUPresentation now (see
+        // layoutMUPortrait's note).
         let w = bounds.width
         let h = bounds.height
         let insetX = safe.left + 12
@@ -771,9 +1074,7 @@ extension LivePlayerViewController {
 
         // Header top-left; close top-right (spec: y12).
         mu.nameLabel.frame = CGRect(x: insetX, y: 12, width: w - insetX * 2 - 60, height: 19)
-        mu.nameLabel.font = MUFont.uiBody(14, .semibold)
         mu.noteLabel.frame = CGRect(x: insetX, y: 33, width: w - insetX * 2 - 60, height: 12)
-        mu.noteLabel.font = MUFont.uiBody(9)
         closeButton.frame = CGRect(x: w - insetX - 48, y: 12, width: 48, height: 48)
 
         layoutMiniScore(mu, x: insetX, y: 73, height: 28, crest: 20, fontSize: 11)
@@ -788,7 +1089,6 @@ extension LivePlayerViewController {
         let chipsY = bottom - 44
         layoutChips(mu, x: insetX + 106, y: chipsY, width: contentW - 106)
         mu.allSourcesButton.frame = CGRect(x: insetX, y: chipsY, width: 94, height: 44)
-        mu.sourceLabel.isHidden = true
         let progressY = chipsY - 12 - 28
         layoutProgress(mu, x: insetX, y: progressY, width: contentW)
         let timeY = progressY - 4 - 14
@@ -797,10 +1097,7 @@ extension LivePlayerViewController {
         // Title block (left half).
         layoutEyebrowRow(mu, x: insetX, y: rowY, width: contentW / 2 - 12, titleSize: 25)
         mu.titleLabel.frame = CGRect(x: insetX, y: rowY + 26, width: contentW / 2 - 12, height: 30)
-        mu.titleLabel.font = MUFont.uiDisplay(25)
-        applyMUKern(mu.titleLabel, factor: -0.015)
         mu.statusLabel.frame = CGRect(x: insetX, y: rowY + 58, width: contentW / 2 - 12, height: 12)
-        mu.statusLabel.font = MUFont.uiBody(9)
         // Toolbar (right half, right-aligned).
         layoutToolbar(mu, x: insetX + contentW / 2 + 12, y: rowY + 9, width: contentW / 2 - 12)
     }
@@ -907,7 +1204,9 @@ extension LivePlayerViewController {
     }
 
     private func layoutSourceHeader(_ mu: MUChromeViews, x: CGFloat, y: CGFloat, width: CGFloat) {
-        mu.sourceLabel.isHidden = false
+        // FIX-143: the source label's visibility is
+        // presentation (applyMUPresentation); only its
+        // frame is geometry and stays here.
         mu.sourceLabel.frame = CGRect(x: x, y: y, width: width - 120, height: 44)
         mu.allSourcesButton.frame = CGRect(x: x + width - 120, y: y, width: 120, height: 44)
     }
@@ -947,6 +1246,20 @@ extension LivePlayerViewController {
     }
 
     @objc func muAllSourcesTapped() {
+        // FIX-144: the board is a SwiftUI sheet on the
+        // player cover — while the fullscreen presentation
+        // is up it would stack UNDER it (presentation
+        // stacking follows the view-controller tree, and
+        // the cover sits below the presented controller).
+        // Exit fullscreen first; the dismissal's completion
+        // opens the board once the player view is home.
+        // Mid-flight taps ride the parity queue like any
+        // toggle (see openBoardAfterExit on MUChromeViews).
+        if MUFullscreenState.presentedController != nil, let mu = muChrome {
+            mu.openBoardAfterExit = true
+            muToggleFullscreen()
+            return
+        }
         onSourceSwitch?()
         showControls()
     }
@@ -1004,8 +1317,61 @@ extension LivePlayerViewController {
     /// (mu.landscape), falling back to its own bounds test —
     /// no new persistent state beyond MUFullscreenState,
     /// which ContentView needs for its route-change guard.
+    /// `MUFullscreenState.isActive` is still WRITTEN here as
+    /// that record, but it is not the decision source.
+    ///
+    /// FIX-139: this restores the 1.35 decision source — the
+    /// LIVE LAYOUT — in place of the FIX-137 decision by
+    /// `MUFullscreenState.isActive`. That flag is flipped
+    /// optimistically, before the rotation it requests has
+    /// actually happened, so when a geometry update was
+    /// rejected (see FIX-139 in DaBanhApp.swift) the flag and
+    /// the window disagreed: the flag said "not fullscreen"
+    /// while the window stayed landscape, the next tap read
+    /// the flag and chose ENTER again, and the player could
+    /// never return to portrait — one rejected rotation
+    /// became a self-sustaining landscape lock-out (WP4 of
+    /// the full review). Deciding from the live layout makes
+    /// the toggle follow the window as it actually is. The
+    /// live interface orientation, the layout flag and the
+    /// chosen direction are logged with every toggle so the
+    /// device log can convict any residual mismatch.
     @objc func muToggleFullscreen() {
+        // FIX-143 (§3.2): the picture layer's numbers at
+        // the toggle itself. Pure instrumentation — the
+        // FIX-142 queue and the FIX-139 decision below are
+        // untouched.
+        logMULayerLine(context: "toggle")
+        // FIX-142: a toggle fired while a rotation
+        // transition is in flight is QUEUED, not dropped.
+        // FIX-141's coalescing discarded it outright (no
+        // second lock/geometry request until the in-flight
+        // transition settled), which ate the corrective
+        // tap a viewer fires mid-rotation (DIAG-142). Now
+        // the tap flips the pendingToggle parity bit on
+        // the chrome's state bag, and the transition's
+        // completion (finishMURotation, PlayerView.swift)
+        // runs ONE fresh toggle through the FIX-139
+        // decision below — two mid-flight taps cancel
+        // (parity, not a counter), so requests still
+        // never stack (DIAG-140's disease). The FIX-139
+        // decision below is untouched and runs as before
+        // once no transition is in flight.
+        if let mu = muChrome, mu.transitionInFlight {
+            mu.pendingToggle.toggle()
+            DiagLog.log("player",
+                        "mu fullscreen toggle: queued (transition in flight) "
+                        + "state=\(playbackStateName)")
+            showControls()
+            return
+        }
         let isLandscape = muChrome?.landscape ?? (view.bounds.width > view.bounds.height)
+        let live = view.window?.windowScene?.interfaceOrientation
+        DiagLog.log("player",
+                    "mu fullscreen toggle: interface=\(live?.rawValue ?? -1) "
+                    + "layoutLandscape=\(isLandscape) "
+                    + "direction=\(isLandscape ? "exit" : "enter") "
+                    + "state=\(playbackStateName)")
         if isLandscape {
             MUFullscreenState.isActive = false
             OrientationHelper.lock(.all, rotateTo: .portrait)
@@ -1014,6 +1380,331 @@ extension LivePlayerViewController {
             OrientationHelper.lock(.landscape, rotateTo: .landscapeRight)
         }
         showControls()
+        // FIX-144 (Option A): the FIX-139 decision above is
+        // unchanged — it still decides the direction from
+        // the live layout, still writes the state record,
+        // still makes the same lock requests. What carries
+        // the decision out is new: the fullscreen
+        // presentation that hosts this player. The sync is
+        // idempotent — it presents on an enter decision
+        // with no presentation up, dismisses on an exit
+        // decision with one up, and does nothing when the
+        // hosting already matches the decision (a toggle
+        // decided from a physically rotated page has no
+        // presentation to move).
+        syncMUFullscreenHosting()
+    }
+
+    // MARK: - Fullscreen hosting (FIX-144, Option A)
+
+    /// FIX-144: reconcile the fullscreen presentation with
+    /// the state the FIX-139 decision just wrote. Called
+    /// at the end of every unqueued toggle (a queued
+    /// toggle is serviced later by a fresh toggle through
+    /// finishMURotation, which lands here the same way).
+    func syncMUFullscreenHosting() {
+        guard isMUChrome, let mu = muChrome else { return }
+        if MUFullscreenState.isActive {
+            guard MUFullscreenState.presentedController == nil else { return }
+            beginMUFullscreenPresentation(mu)
+        } else {
+            guard MUFullscreenState.presentedController != nil else { return }
+            beginMUFullscreenDismissal(mu)
+        }
+    }
+
+    /// The presenter for the fullscreen controller: this
+    /// surface's topmost ancestor — the cover's hosting
+    /// controller, which outlives every surface swap (a
+    /// presentation anchored on a surface would be
+    /// dismissed automatically when that surface is
+    /// dismantled, stranding the successor).
+    private func muFullscreenPresenter() -> UIViewController {
+        var top: UIViewController = self
+        while let parent = top.parent { top = parent }
+        return top
+    }
+
+    /// ENTER: save the host slot, move the WHOLE player
+    /// view into a fresh fullscreen controller and present
+    /// it — KSPlayer's updateUI(isFullScreen:) mapped to
+    /// this app's frame-based view (its edge-pin
+    /// constraints are the frame + flexible autoresizing
+    /// set here; there are no app-owned constraints to
+    /// deactivate). The AVPlayer, its item, the session
+    /// and every observation stay exactly where they are:
+    /// only the view changes parent. The present is NOT
+    /// animated and carries no custom transition
+    /// (FIX-145): the turn itself is the window's,
+    /// driven by the FIX-139 geometry update, and its
+    /// settle is the coordinator's finishMURotation —
+    /// the completion below does hosting bookkeeping
+    /// only.
+    private func beginMUFullscreenPresentation(_ mu: MUChromeViews) {
+        guard let host = view.superview else { return }
+        mu.hostOriginalSuperview = host
+        mu.hostOriginalIndex = host.subviews.firstIndex(of: view) ?? host.subviews.count
+        mu.hostOriginalFrame = view.frame
+        mu.hostOriginalAutoresizingMask = view.autoresizingMask
+        // A fresh enter cancels a board request left over
+        // from an earlier exit path (the viewer's latest
+        // act was this toggle).
+        mu.openBoardAfterExit = false
+        mu.hostingTransitionInFlight = true
+        let fsVC = MUFullscreenViewController()
+        fsVC.modalPresentationStyle = .fullScreen
+        fsVC.modalPresentationCapturesStatusBarAppearance = true
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        fsVC.view.addSubview(view)
+        view.frame = fsVC.view.bounds
+        MUFullscreenState.presentedController = fsVC
+        MUFullscreenState.hostedController = self
+        DiagLog.log("player",
+                    "mu fullscreen hosting: presenting (host slot "
+                    + "\(muFmtRect(mu.hostOriginalFrame)))")
+        // FIX-144 gate restarted Round 1 (B-8): this
+        // completion captures self STRONGLY, on purpose.
+        // It is the ONLY service point for a teardown
+        // release deferred during the present; with a weak
+        // capture, a surface SwiftUI deallocates inside
+        // the present window (ladder exhaustion, no
+        // successor) would take the completion with it
+        // and strand the presented controller on screen
+        // with no living owner. The retention is bounded:
+        // UIKit holds the handler only until it fires —
+        // and drops it unrun on a refused present, where
+        // the rollback below has already restored the
+        // surface — so it cannot form a cycle: nothing on
+        // the surface retains the handler.
+        muFullscreenPresenter().present(fsVC, animated: false) {
+            guard let mu = self.muChrome else { return }
+            mu.hostingTransitionInFlight = false
+            // FIX-144 gate Round 1 (B-4): a teardown
+            // that landed during this present deferred
+            // its release to this completion — service
+            // it instead of acting for a dead surface.
+            if mu.releasePendingAfterFlight {
+                mu.releasePendingAfterFlight = false
+                self.releaseMUFullscreenHostingForTeardown()
+                return
+            }
+            // FIX-144 gate Round 1 (B-3): if a successor
+            // adopted the presentation during the present,
+            // the hosting already landed on ITS surface —
+            // this completion has nothing left to do.
+            guard MUFullscreenState.hostedController === self else {
+                DiagLog.log("player",
+                            "mu fullscreen hosting: present completion "
+                            + "on a superseded surface — hosting already "
+                            + "with the successor")
+                return
+            }
+            // FIX-145: no settle here — the turn belongs
+            // to the window's coordinator, whose completion
+            // (finishMURotation) settles it, as in 1.43.
+        }
+        // FIX-144 gate Round 1 (B-2): present() can be
+        // refused (the presenter is already presenting
+        // or mid-transition) — a no-op whose completion
+        // never runs. An accepted presentation has its
+        // presentingViewController set synchronously, so
+        // a missing one here IS the refusal. Roll the
+        // whole enter back: the view returns to its host
+        // slot (picture never lost) and the records are
+        // nilled. The turn itself is unaffected — the
+        // FIX-139 lock already requested it, so the
+        // window rotates in place and the coordinator
+        // path settles it, exactly the 1.43 fallback;
+        // and since the FIX-139 decision re-reads the
+        // LIVE layout, the next toggle re-attempts the
+        // enter from the truth.
+        if fsVC.presentingViewController == nil {
+            MUFullscreenState.presentedController = nil
+            if MUFullscreenState.hostedController === self {
+                MUFullscreenState.hostedController = nil
+            }
+            let index = min(mu.hostOriginalIndex, host.subviews.count)
+            host.insertSubview(view, at: index)
+            view.frame = mu.hostOriginalFrame
+            view.autoresizingMask = mu.hostOriginalAutoresizingMask
+            mu.hostingTransitionInFlight = false
+            DiagLog.log("player",
+                        "mu fullscreen hosting: present REFUSED — "
+                        + "enter rolled back to the host slot")
+        }
+    }
+
+    /// EXIT: dismiss the fullscreen controller (not
+    /// animated, no custom transition — FIX-145); this
+    /// completion restores the player view HOME — the
+    /// saved superview, index and frame (KSPlayer's
+    /// dismissal completion). The turn back is the
+    /// window's own: the FIX-139 lock requested it, and
+    /// the coordinator's finishMURotation settles it at
+    /// the restored portrait rest, as in 1.43 — this
+    /// completion does hosting bookkeeping only.
+    private func beginMUFullscreenDismissal(_ mu: MUChromeViews) {
+        guard let fsVC = MUFullscreenState.presentedController else { return }
+        mu.hostingTransitionInFlight = true
+        DiagLog.log("player", "mu fullscreen hosting: dismissing")
+        fsVC.dismiss(animated: false) { [weak self] in
+            guard let self else { return }
+            let mu = self.muChrome
+            mu?.hostingTransitionInFlight = false
+            // The records are retired only if they still
+            // name THIS presentation. If they were
+            // re-pointed (a teardown release, or a
+            // successor's fresh presentation), this
+            // completion owns nothing — and the trip is
+            // LOGGED, not silent (gate Round 1, B-5).
+            guard MUFullscreenState.presentedController === fsVC else {
+                DiagLog.log("player",
+                            "mu fullscreen hosting: dismiss completion "
+                            + "for a superseded presentation — records kept")
+                return
+            }
+            MUFullscreenState.presentedController = nil
+            if MUFullscreenState.hostedController === self {
+                MUFullscreenState.hostedController = nil
+            }
+            // A surface torn down mid-dismissal (source
+            // swap inside the dismissal window) restores
+            // nothing: its view is discarded with it, and
+            // no restore or board service runs on the dead.
+            if self.isTorn {
+                DiagLog.log("player",
+                            "mu fullscreen hosting: dismissed under "
+                            + "a torn surface — restore skipped")
+                return
+            }
+            // Restore the view HOME — the saved superview,
+            // index, frame and autoresizing mask
+            // (KSPlayer's dismissal completion).
+            if let host = mu?.hostOriginalSuperview {
+                let index = min(mu?.hostOriginalIndex ?? host.subviews.count,
+                                host.subviews.count)
+                host.insertSubview(self.view, at: index)
+                self.view.frame = mu?.hostOriginalFrame ?? self.view.frame
+                self.view.autoresizingMask = mu?.hostOriginalAutoresizingMask ?? []
+            }
+            if let mu, mu.openBoardAfterExit {
+                mu.openBoardAfterExit = false
+                self.onSourceSwitch?()
+                self.showControls()
+            }
+        }
+    }
+
+    /// FIX-144: a surface born while the fullscreen
+    /// presentation is up — an in-place source advance or
+    /// chip switch replaces this controller wholesale
+    /// (the surface is keyed by rung), under the still-
+    /// presented fullscreen controller — adopts the
+    /// hosting: the previous surface's view is vacated
+    /// and this surface's view moves into the presented
+    /// controller in its place, at the hosted landscape
+    /// rest (the layout the move triggers applies the
+    /// full geometry + presentation, the same cut the
+    /// in-place swap made inside the rotated window in
+    /// 1.43). If the swap lands inside a present/dismiss
+    /// window, the move is still safe: there is no
+    /// custom transition that could re-insert the torn
+    /// predecessor's view over this one (FIX-145), and
+    /// the sweep below removes whatever the predecessor
+    /// left in the fullscreen view. Called from
+    /// viewDidAppear; a no-op in every other state.
+    func adoptMUFullscreenHostingIfNeeded() {
+        guard isMUChrome, let mu = muChrome else { return }
+        guard MUFullscreenState.isActive,
+              MUFullscreenState.hostedController !== self else { return }
+        // FIX-144 gate Round 1 (B-4): teardown-before-
+        // adopt ordering — the previous surface's
+        // teardown release already retired the
+        // presentation before this successor appeared.
+        // The adoption then IS a fresh enter from this
+        // surface's own host slot, so the two orderings
+        // converge on the same end state. (If that
+        // present is refused, the B-2 rollback inside
+        // the enter keeps the picture in the host.)
+        guard let fsVC = MUFullscreenState.presentedController else {
+            DiagLog.log("player",
+                        "mu fullscreen hosting: successor found no "
+                        + "presentation up — re-presenting")
+            beginMUFullscreenPresentation(mu)
+            return
+        }
+        guard let host = view.superview, host !== fsVC.view else { return }
+        // Sweep whatever the previous surface left in
+        // the fullscreen view — its own view, or a dead
+        // predecessor's (whose controller record has
+        // already nilled): the presented view hosts
+        // exactly ONE player view, this surface's.
+        for subview in fsVC.view.subviews where subview !== view {
+            subview.removeFromSuperview()
+        }
+        mu.hostOriginalSuperview = host
+        mu.hostOriginalIndex = host.subviews.firstIndex(of: view) ?? host.subviews.count
+        mu.hostOriginalFrame = view.frame
+        mu.hostOriginalAutoresizingMask = view.autoresizingMask
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        fsVC.view.addSubview(view)
+        view.frame = fsVC.view.bounds
+        MUFullscreenState.hostedController = self
+        DiagLog.log("player",
+                    "mu fullscreen hosting: adopted by source "
+                    + "#\(sourceIndex) (in-place swap under the presentation)")
+    }
+
+    /// FIX-144: teardown of the HOSTED surface with no
+    /// successor adopting (the player is closing, or the
+    /// ladder ran out under it) releases the presentation
+    /// with it — the view is being discarded either way.
+    /// If a successor already adopted, the record names
+    /// it, not this surface, and this is a no-op; if the
+    /// successor has NOT adopted yet, its adoption finds
+    /// no presentation up and re-presents (gate Round 1,
+    /// B-4) — the two orderings converge. MUFullscreenState
+    /// .isActive is NOT touched — ContentView owns its
+    /// reset on a genuine close, as before.
+    func releaseMUFullscreenHostingForTeardown() {
+        guard MUFullscreenState.hostedController === self,
+              let fsVC = MUFullscreenState.presentedController else { return }
+        // FIX-144 gate Round 1 (B-4): never dismiss
+        // against a present/dismiss this surface still
+        // has in flight — the records would be nilled
+        // while UIKit may still complete the call,
+        // leaving an on-screen controller no record
+        // names. Defer: the in-flight call's completion
+        // resolves the release (and if a successor
+        // adopts first, the record no longer names this
+        // surface and the deferred release no-ops).
+        if let mu = muChrome, mu.hostingTransitionInFlight {
+            mu.releasePendingAfterFlight = true
+            DiagLog.log("player",
+                        "mu fullscreen hosting: teardown during "
+                        + "a flight — release deferred to its completion")
+            return
+        }
+        MUFullscreenState.hostedController = nil
+        MUFullscreenState.presentedController = nil
+        DiagLog.log("player",
+                    "mu fullscreen hosting: released at teardown "
+                    + "(source #\(sourceIndex))")
+        fsVC.dismiss(animated: false)
+    }
+
+    /// FIX-144: the controller the MU action sheets
+    /// (More / Quality / Audio) present from. While the
+    /// fullscreen presentation is up, a sheet presented
+    /// from THIS controller would stack under it —
+    /// presentation stacking follows the view-controller
+    /// tree, and this controller sits in the cover's tree
+    /// below the presented controller, wherever its view
+    /// currently lives. The sheets therefore present from
+    /// the fullscreen controller while it is up, and from
+    /// this controller otherwise (the 1.43 behaviour).
+    private func muSheetPresenter() -> UIViewController {
+        MUFullscreenState.presentedController ?? self
     }
 
     /// Quality: a real rendition cap on the player item
@@ -1056,7 +1747,7 @@ extension LivePlayerViewController {
             popover.sourceRect = (muChrome?.moreButton ?? closeButton).bounds
             popover.delegate = self
         }
-        present(sheet, animated: true)
+        muSheetPresenter().present(sheet, animated: true)
     }
 
     @objc func muQualityTapped() {
@@ -1084,7 +1775,7 @@ extension LivePlayerViewController {
         // handler — the presentation delegate below releases
         // the keepControlsVisible pin on that path too.
         sheet.popoverPresentationController?.delegate = self
-        present(sheet, animated: true)
+        muSheetPresenter().present(sheet, animated: true)
     }
 
     /// Audio / subtitles: the item's own media selection
@@ -1137,7 +1828,7 @@ extension LivePlayerViewController {
         // F-2: same popover-dismissal pin release as the
         // quality sheet (see muQualityTapped).
         sheet.popoverPresentationController?.delegate = self
-        present(sheet, animated: true)
+        muSheetPresenter().present(sheet, animated: true)
     }
 }
 

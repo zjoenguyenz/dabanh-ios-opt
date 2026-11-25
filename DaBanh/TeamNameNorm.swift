@@ -216,6 +216,12 @@ enum TeamNameNorm {
         "agf aarhus": "agf",
         "lyngby bk": "lyngby",
         "sv darmstadt": "darmstadt",
+        // FIX-137 (DB-31/FL-478), measured on the live ESPN NBA
+        // board + the playlist snapshot (2026-11-24): ESPN writes
+        // "LA Clippers", the playlist writes "Los Angeles
+        // Clippers" — one team, two keys, so the basketball state
+        // could never bind the fixture.
+        "la clippers": "los angeles clippers",
         // REVIEW-127B-LOOP2 Finding 1 (2026-11-20) — measured in
         // the round's own corpus, each pair on the same fixture
         // (same opponent, same date) across sources:
@@ -712,6 +718,33 @@ enum TeamNameNorm {
         //   report: the FIX-MU-5 entry itself is untouched).
         "kv kortrijk": "kortrijk",
         "union sg": "union saint gilloise",
+        // FL-482 (2026-11-24) — the fixture the owner caught
+        // live on Sony: the playlist's "Al-Sadd Sports Club"
+        // (JOHAN listing, kickoff 2026-11-25T01:15 ICT) beside
+        // FotMob's "Al-Sadd" (AFC Champions League Elite,
+        // FT 2–1). Measured unbound by dup-scan run
+        // 20261124T132437: playlist pair "al nassr vs al sadd
+        // sports" sits in unbound_with_feed with the FotMob
+        // pair "al nassr vs al sadd" as its near pair — the
+        // home side already converges ("Al Nassr" / "Al Nassr
+        // FC" → "al nassr", fc is filler), the away side
+        // strands on "sports".
+        // Shape fixed by leader ruling (2026-11-24): ONE fix
+        // shape across platforms — the whole-name alias, the
+        // shape of the tvOS copy's "al shamal sports" →
+        // "al shamal" precedent (this tree's copy of the
+        // shared file never received that entry; the two
+        // copies have diverged and are synced by hand, entry
+        // by entry). "sports" is deliberately NOT added to
+        // fillerTokens on this side either: a filler drop is
+        // symmetric across every layer (grouping, binding,
+        // crest keys) and unmeasured beyond this fixture;
+        // that change was frozen first on this side,
+        // considered and deferred by the leader — it may
+        // return as its own measured round with the
+        // unbound-pair backlog. The "al sadd" stem has
+        // exactly one producer club (the aarhus test).
+        "al sadd sports": "al sadd",
     ]
 
     /// Trailing city qualifiers (step 7 — measured 2026-11-20,

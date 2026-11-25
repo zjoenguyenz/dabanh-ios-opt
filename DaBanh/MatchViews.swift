@@ -131,17 +131,34 @@ struct FixtureEntry: Identifiable {
     /// The board's badge text for a live fixture: the matched
     /// state's own minute/status, or the bounded computed clock
     /// when no source matched (never a fabricated score).
+    /// FIX-139 (DB-31/FL-478, WP5 root cause): the bounded clock
+    /// is a FOOTBALL clock (45'+x', frozen "90+'") — it must never
+    /// render for a fixture that is not positively identified as
+    /// football. FIX-137's gate tested `sportRank == 0`, but 0 was
+    /// also the fall-through for untagged channels (untagged
+    /// defaults), and the playlist carries no 🏒 tags at all — an
+    /// NHL fixture passed as "football" and wore a fabricated
+    /// minute. The gate now requires positive football identity
+    /// via `LeagueClassifier.isIdentifiedFootball` (a ⚽ tag, or a
+    /// title matched to a known football league). A fixture WITH
+    /// a bound state never reaches this fallback — the state's
+    /// own clock renders instead.
     var liveBadgeText: String? {
         if let state { return state.badgeText }
         guard isLive, let kickoff = channel.kickoff else { return nil }
+        guard LeagueClassifier.isIdentifiedFootball(channel) else { return nil }
         return BoundedClock.text(kickoff: kickoff)
     }
 
     /// True when the live badge should wear the half-time amber:
     /// a matched HT state, or the computed clock's HT estimate.
+    /// The stateless estimate gets the same FIX-139 positive
+    /// football-identity gate as the badge text — no football
+    /// half-time estimate on an unidentified fixture.
     var isHalfTimeDisplay: Bool {
         if let state { return state.status == .halfTime }
         guard let kickoff = channel.kickoff else { return false }
+        guard LeagueClassifier.isIdentifiedFootball(channel) else { return false }
         return isLive && BoundedClock.isHalfTimeEstimate(kickoff: kickoff)
     }
 

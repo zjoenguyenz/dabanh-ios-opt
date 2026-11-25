@@ -362,6 +362,15 @@ private struct ESPNCompetitorDTO: Decodable {
     let homeAway: String?
     let score: String?
     let team: ESPNTeamDTO?
+    /// Per-period scores (FIX-137, basketball): the NBA
+    /// scoreboard carries one entry per played period; the
+    /// soccer board's competitors do not need it and never read
+    /// it — decoding an extra optional field changes nothing
+    /// on the soccer path.
+    let linescores: [ESPNLinescoreDTO]?
+}
+private struct ESPNLinescoreDTO: Decodable {
+    let displayValue: String?
 }
 private struct ESPNTeamDTO: Decodable {
     let id: String?
@@ -388,6 +397,11 @@ private struct ESPNAthleteDTO: Decodable { let displayName: String? }
 private struct ESPNStatusDTO: Decodable {
     let displayClock: String?
     let type: ESPNStatusTypeDTO?
+    /// The current period (FIX-137, basketball): the NBA
+    /// scoreboard carries it on every event (1–4 = quarters,
+    /// 5+ = overtime); the soccer status does not carry a
+    /// usable one and the soccer path never reads it.
+    let period: Int?
 }
 private struct ESPNStatusTypeDTO: Decodable {
     let name: String?
@@ -698,6 +712,145 @@ enum MatchStateClient {
         return plain.date(from: raw)
     }
 
+    // MARK: ESPN basketball (NBA) — FIX-137 (DB-31/FL-478)
+
+    /// The NBA scoreboard sweep, the basketball sibling of
+    /// `fetchESPN`: same host, same `?dates=` discipline (the
+    /// ICT seam ±1 day), decoded with the same wire DTOs.
+    /// Designed against the LIVE payload pulled 2026-11-24
+    /// (10 events): `status` carries `period` (1–4 quarters,
+    /// 5+ overtime) and `displayClock` (the game clock, e.g.
+    /// "8:02", "18.3"), `type.detail` reads "8:02 - 2nd
+    /// Quarter" / "Final" / "Final/OT"; `competitions[].details`
+    /// is EMPTY on the scoreboard — there are no scoring plays
+    /// to map — and each competitor carries `linescores`
+    /// (per-period scores), from which the half-time score is
+    /// Q1+Q2 once the second quarter is complete.
+    ///
+    /// States are stamped `source: .espn` (the same layer and
+    /// precedence as the soccer board — pair keys never collide
+    /// across sports) with competition `.other("NBA")`, and the
+    /// live minute text is a BASKETBALL clock ("Q2 · 8:02",
+    /// "OT · 2:34") — never the football BoundedClock, which
+    /// stays a fallback for unmatched FOOTBALL fixtures only
+    /// (the render-side guard is in FixtureEntry.liveBadgeText).
+    static func fetchESPNBasketball() async -> [MatchState] {
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        let now = Date()
+        let dates = [ictDateParam(now.addingTimeInterval(-24 * 3600)),
+                     ictDateParam(now),
+                     ictDateParam(now.addingTimeInterval(24 * 3600))]
+        return await withTaskGroup(of: [MatchState].self) { group in
+            for dateParam in dates {
+                group.addTask {
+                    await fetchESPNBasketballBoard(dateParam: dateParam, session: session)
+                }
+            }
+            var all: [MatchState] = []
+            for await states in group { all += states }
+            return all
+        }
+    }
+
+    private static func fetchESPNBasketballBoard(dateParam: String,
+                                                 session: URLSession) async -> [MatchState] {
+        guard let url = URL(string: "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=\(dateParam)"),
+              let data = await get(url, session: session),
+              let dto = try? JSONDecoder().decode(ESPNDTO.self, from: data),
+              let events = dto.events else { return [] }
+        var out: [MatchState] = []
+        for event in events {
+            guard let comp = event.competitions?.first,
+                  let competitors = comp.competitors, competitors.count == 2,
+                  let home = competitors.first(where: { $0.homeAway == "home" }),
+                  let away = competitors.first(where: { $0.homeAway == "away" }),
+                  let homeName = home.team?.displayName,
+                  let awayName = away.team?.displayName,
+                  let key = MatchMatching.pairKey(team1: homeName, team2: awayName)
+            else { continue }
+            let kickoff = event.date.flatMap { parseISO8601($0) }
+            let dateKey = kickoff.map { FixtureGrouping.stampDateKey(of: $0) } ?? ""
+            let type = event.status?.type
+            let name = (type?.name ?? "").uppercased()
+            let status: MatchStatus
+            var minute: String? = nil
+            if type?.state == "pre" {
+                status = .pre
+            } else if name.contains("POSTPONED") {
+                status = .postponed
+            } else if name.contains("CANCEL") {
+                status = .cancelled
+            } else if type?.state == "post" || type?.completed == true {
+                status = .fullTime
+            } else if name.contains("HALFTIME") || type?.detail == "Halftime" {
+                status = .halfTime
+            } else {
+                status = .live
+                minute = basketballClock(period: event.status?.period,
+                                         displayClock: event.status?.displayClock)
+            }
+            // Half-time score from the linescores (Q1+Q2), only
+            // once the second quarter is COMPLETE — the game is
+            // at half-time, in Q3/Q4/OT, or finished. During Q2
+            // the second linescore is still moving and stamping
+            // it as a half-time score would print a running sum
+            // under the half-time label.
+            var htHome: Int? = nil
+            var htAway: Int? = nil
+            if status == .halfTime || status == .fullTime
+                || (event.status?.period ?? 0) >= 3 {
+                htHome = halftimeScore(from: home.linescores)
+                htAway = halftimeScore(from: away.linescores)
+                if htHome == nil || htAway == nil { htHome = nil; htAway = nil }
+            }
+            // The feed's own badges join Crests' learned registry,
+            // exactly as on the soccer board (DB-02).
+            let homeLogo = home.team?.logo.flatMap { URL(string: $0) }
+            let awayLogo = away.team?.logo.flatMap { URL(string: $0) }
+            if let homeLogo { Crests.registerLearnedLogo(forTeam: homeName, logoURL: homeLogo) }
+            if let awayLogo { Crests.registerLearnedLogo(forTeam: awayName, logoURL: awayLogo) }
+            out.append(MatchState(
+                pairKey: key, dateKey: dateKey, eventKickoff: kickoff,
+                status: status, minuteText: minute,
+                scoreHome: home.score.flatMap { Int($0) },
+                scoreAway: away.score.flatMap { Int($0) },
+                htHome: htHome, htAway: htAway,
+                goals: [], cards: [],
+                competition: .other(label: "NBA"), source: .espn,
+                fotmobID: nil, fetchedAt: Date(),
+                womenMarked: false))
+        }
+        return out
+    }
+
+    /// The basketball live clock text for the badge/hero: the
+    /// quarter (or overtime) plus ESPN's own game clock —
+    /// "Q2 · 8:02", "Q4 · 18.3", "OT · 2:34", "OT2 · 1:05".
+    /// Falls back to the bare game clock when the period is
+    /// missing, and to nil when ESPN carries neither (the state
+    /// then renders a plain LIVE, never an invented clock).
+    private static func basketballClock(period: Int?, displayClock: String?) -> String? {
+        guard let displayClock, !displayClock.isEmpty else { return nil }
+        guard let period, period >= 1 else { return displayClock }
+        switch period {
+        case 1...4: return "Q\(period) · \(displayClock)"
+        case 5: return "OT · \(displayClock)"
+        default: return "OT\(period - 4) · \(displayClock)"
+        }
+    }
+
+    /// Q1+Q2 from a competitor's linescores, or nil when fewer
+    /// than two periods are recorded or either is unparseable
+    /// (fail closed — no half-time line rather than a wrong one).
+    private static func halftimeScore(from linescores: [ESPNLinescoreDTO]?) -> Int? {
+        guard let linescores, linescores.count >= 2,
+              let q1 = linescores[0].displayValue.flatMap({ Int($0) }),
+              let q2 = linescores[1].displayValue.flatMap({ Int($0) })
+        else { return nil }
+        return q1 + q2
+    }
+
     // MARK: FotMob
 
     /// The FotMob competition map (spec §3.3, measured names —
@@ -936,11 +1089,11 @@ enum MatchStateClient {
     /// `minuteText` stays nil and goals/cards stay empty — the
     /// bounded clock and the ESPN/FotMob layers own those.
     ///
-    /// The basketball feed (f_3) is deliberately NOT fetched: this
-    /// app binds football fixtures only — no basketball fixture,
-    /// pair-keyed state or tab exists anywhere in DaBanh (the one
-    /// "NBA" hit is a Nuvio channel-family comment) — so NBB
-    /// states could never bind and would only pollute the store.
+    /// The Flashscore basketball feed (f_3) is deliberately NOT
+    /// fetched: basketball fixtures bind through the ESPN NBA
+    /// board instead (FIX-137, DB-31/FL-478 — score + quarter
+    /// clock + linescores), which carries the fuller record;
+    /// this layer stays soccer-only.
     static func fetchFlashscore() async -> [MatchState] {
         let session = makeSession()
         defer { session.invalidateAndCancel() }
@@ -1108,6 +1261,20 @@ final class MatchStateStore: ObservableObject {
     @Published private(set) var revision = 0
 
     private(set) var states: [MatchState] = []
+    /// FIX-141: lazily built pairKey index over `states` for the
+    /// state lookup — the baseline `state(for:)` ran a linear
+    /// `states.filter` over all ~605 states for EVERY fixture
+    /// entry of EVERY board rebuild (DIAG-140-SMOOTH §3.2:
+    /// ~120k candidate evaluations per pass, ≥3–4 passes per
+    /// publish). The index groups states by pairKey, appending
+    /// in `states` order, so each bucket holds exactly the
+    /// subsequence the old filter produced for that key, in the
+    /// same order; the lookup then date-filters only that bucket.
+    /// nil = dirty: every mutation of `states` sets it back to
+    /// nil (the refresh publish assign, the empty-snapshot clear
+    /// and the detail-upgrade mutation loop), and the next lookup
+    /// rebuilds it on first use.
+    private var stateIndex: [String: [MatchState]]?
     /// Set by PlaylistStore after each publish: true while any
     /// fixture sits in its live window or is matched-live.
     var liveHint = false
@@ -1123,40 +1290,6 @@ final class MatchStateStore: ObservableObject {
     private var loopTask: Task<Void, Never>?
     private var refreshing = false
     private var detailCache: [Int: (goals: [GoalEvent], cards: [CardEvent])] = [:]
-    /// E2 (AUDIT.md): what a cached `detailCache` entry was
-    /// fetched against — the FotMob state's own score and whether
-    /// it was full-time, captured when the fetch was ISSUED (before
-    /// the await) and written in the same step as the cache entry
-    /// (`storeDetails`), so the refresh cycle can tell when a match
-    /// has scored (or had a goal taken back) or finished since its
-    /// incidents were fetched, and fetch them again.
-    ///
-    /// `home`, `away` and `atFullTime` are the issued EPISODE.
-    /// `fullTimeAccepted` counts the accepted fetches issued at
-    /// full time for this id, carried forward across stamps
-    /// (`storeDetails`); the full-time settling budget reads it.
-    private struct DetailStamp {
-        let home: Int?
-        let away: Int?
-        let atFullTime: Bool
-        var fullTimeAccepted = 0
-
-        /// Same issued score and full-time flag (the episode a
-        /// lagging result is counted against).
-        func sameEpisode(as other: DetailStamp) -> Bool {
-            home == other.home && away == other.away && atFullTime == other.atFullTime
-        }
-    }
-    private var detailStamp: [Int: DetailStamp] = [:]
-    /// Consecutive lagging results for an id, banked WITH the
-    /// episode (issued score + full-time flag) they were counted
-    /// against; a lagging result for a different episode restarts
-    /// the count at 1. Cleared when a result is accepted.
-    private var detailRejects: [Int: (episode: DetailStamp, count: Int)] = [:]
-    private static let maxDetailRejects = 3
-    /// Accepted fetches issued at full time after which a cached
-    /// entry stops qualifying for full-time settling fetches.
-    private static let fullTimeFetchBudget = 3
 
     func start() {
         guard loopTask == nil else { return }
@@ -1189,11 +1322,16 @@ final class MatchStateStore: ObservableObject {
             now.timeIntervalSince($0) > 3600
         } ?? true
         async let espnFetch = MatchStateClient.fetchESPN(full: full, activeSlugs: knownSlugs)
+        // FIX-139 (DB-31/FL-478 scheduling): the NBA board rides
+        // the cycle only while its sweep is due (see
+        // `nbaSweepDue`) — FIX-137 ran it ungated on every cycle.
+        async let nbaFetch = fetchNBAIfDue(now: now)
         async let fotmobFetch = MatchStateClient.fetchFotMob()
         async let flashFetch = MatchStateClient.fetchFlashscore()
         async let liveFetch = MatchStateClient.fetchLiveScoreLive()
         async let dateFetch = MatchStateClient.fetchLiveScoreDate(ifNeeded: wantDateFeed)
         let espnStates = await espnFetch
+        let nbaStates = await nbaFetch
         let fotmobStates = await fotmobFetch
         let flashStates = await flashFetch
         let liveStates = await liveFetch
@@ -1207,7 +1345,11 @@ final class MatchStateStore: ObservableObject {
         // in `filledFromPool`, where the date-agreed pool for the
         // fixture is known — FIX-127.)
         var merged: [String: MatchState] = [:]
-        for state in dateStates + liveStates + flashStates + fotmobStates + espnStates {
+        // The NBA states merge LAST, with the ESPN soccer states:
+        // same layer, and pair keys never collide across sports,
+        // so no soccer binding can be displaced by a basketball
+        // state or vice versa (FIX-137).
+        for state in dateStates + liveStates + flashStates + fotmobStates + espnStates + nbaStates {
             merged[state.pairKey + "|" + state.dateKey] = state
         }
         // FotMob states inherit any cached matchDetails incidents
@@ -1228,190 +1370,149 @@ final class MatchStateStore: ObservableObject {
             }
             if !states.isEmpty {
                 states = []
+                stateIndex = nil // FIX-141: `states` mutated — index dirty
                 revision += 1
             }
             return
         }
-        states = upgraded
+        // FIX-141: the FotMob incidents upgrade (RC2) now runs
+        // HERE, on the merged snapshot itself, before the publish
+        // guard — the baseline ran it after the publish as
+        // `upgradeLiveFotMobDetails()`, fetching serially and
+        // bumping `revision` again per successful fetch (up to 4
+        // extra full board re-renders per cycle, DIAG-140-SMOOTH
+        // §3.1). Applied to `upgraded` pre-comparison, the details
+        // ride the cycle's one publish: the sameSnapshot guard
+        // below sees the final content, and the single assign +
+        // single bump publishes states and incidents together.
+        await applyFotMobDetails(to: &upgraded)
+        // FIX-139 (review WP3 layer 2): publish only on change.
+        // The baseline assigned and bumped `revision` on EVERY
+        // cycle; PlaylistStore forwards every bump as
+        // objectWillChange into a full board re-render, so the
+        // board rebuilt itself once a cycle even when nothing
+        // had moved. The comparison ignores `fetchedAt` — every
+        // feed rebuilds it fresh each cycle and nothing in the
+        // tree reads it — and element order (the merge above is
+        // dictionary-backed, so order is not stable). The cycle
+        // bookkeeping below (lastSuccessAt & friends, knownSlugs)
+        // is NOT render state and keeps its unconditional
+        // baseline behaviour.
+        let snapshotChanged = !Self.sameSnapshot(states, upgraded)
+        if snapshotChanged {
+            states = upgraded
+            stateIndex = nil // FIX-141: `states` mutated — index dirty
+        }
         lastSuccessAt = now
         if full { lastFullAt = now }
         if wantDateFeed { lastLiveScoreDateAt = now }
         knownSlugs = Set(espnStates.map { state in
             MatchStateClient.espnSlugs.first { $0.competition == state.competition }?.slug ?? ""
         }.filter { !$0.isEmpty })
-        revision += 1
+        if snapshotChanged { revision += 1 }
         DiagLog.log("cluster",
                     "cycle full=\(full): espn=\(espnStates.count) "
+                    + "nba=\(nbaStates.count) "
                     + "fotmob=\(fotmobStates.count) flash=\(flashStates.count) "
                     + "livescore=\(liveStates.count + dateStates.count) "
                     + "merged=\(upgraded.count) "
                     + "live=\(upgraded.filter { $0.status.isLiveish }.count)")
-        // RC2 (2026-11-19): the FotMob incidents upgrade also runs
-        // on this refresh cycle — the 60 s live cycle included —
-        // not only at playlist publish, so scorers/cards land
-        // within a cycle of the state that needs them.
-        await upgradeLiveFotMobDetails()
+        // FIX-141: no post-publish upgrade call remains — the
+        // RC2 FotMob incidents upgrade ran above, on the merged
+        // snapshot, so this cycle published exactly once.
+    }
+
+    /// When the NBA sweep last ran (FIX-139): the discovery
+    /// cadence in `nbaSweepDue` reads it.
+    private var lastNBASweepAt: Date?
+
+    /// FIX-139 (DB-31/FL-478 scheduling): the NBA sweep is due
+    /// while a basketball state currently held is live or tips
+    /// off inside the live/upcoming window (kickoff within
+    /// −3 h…+12 h), and as a slow discovery sweep at most once
+    /// an hour otherwise — the board's ±1-day dates mean one
+    /// sweep sees three days of fixtures, so a game appearing
+    /// later in the day still binds the same day. When the sweep
+    /// is not due the merge produces no NBA states and the
+    /// snapshot drops them, so they can neither hold the 60 s
+    /// cadence through PlaylistStore's `liveHint` nor tax the
+    /// per-render state scans — the two costs FIX-137's ungated
+    /// every-cycle sweep paid at hours when nothing was live.
+    private func nbaSweepDue(now: Date) -> Bool {
+        let horizon = now.addingTimeInterval(12 * 3600)
+        let recentPast = now.addingTimeInterval(-3 * 3600)
+        let relevant = states.contains { state in
+            state.competition == .other(label: "NBA")
+                && (state.status.isLiveish
+                    || (state.eventKickoff.map {
+                        $0 >= recentPast && $0 <= horizon
+                    } ?? false))
+        }
+        if relevant { return true }
+        return lastNBASweepAt.map { now.timeIntervalSince($0) >= 3600 } ?? true
+    }
+
+    /// Runs the NBA sweep when due and stamps the run; returns
+    /// no states when it is not due (FIX-139).
+    private func fetchNBAIfDue(now: Date) async -> [MatchState] {
+        guard nbaSweepDue(now: now) else { return [] }
+        lastNBASweepAt = now
+        return await MatchStateClient.fetchESPNBasketball()
+    }
+
+    /// Snapshot equality for the publish guard (FIX-139): same
+    /// fixture keys, and every state equal modulo `fetchedAt`
+    /// (rebuilt fresh by every feed each cycle; nothing in the
+    /// tree reads it, so it cannot carry a visible change).
+    private static func sameSnapshot(_ a: [MatchState], _ b: [MatchState]) -> Bool {
+        guard a.count == b.count else { return false }
+        let keyed = Dictionary(a.map { ("\($0.pairKey)|\($0.dateKey)", $0) },
+                               uniquingKeysWith: { first, _ in first })
+        for state in b {
+            guard let old = keyed["\(state.pairKey)|\(state.dateKey)"]
+            else { return false }
+            var normalised = state
+            normalised.fetchedAt = old.fetchedAt
+            if normalised != old { return false }
+        }
+        return true
     }
 
     /// The refresh-cycle form of the FotMob incidents upgrade
-    /// (RC2): same discipline as `upgradeDetails(for:)` — FotMob
+    /// (RC2), restructured by FIX-141: same discipline as the
+    /// deleted post-publish `upgradeLiveFotMobDetails()` — FotMob
     /// states only (the details endpoint is FotMob-only), capped
-    /// at 4 per pass, live first — driven from the store's own
-    /// states because the cycle has no channel list. A state
-    /// qualifies when it lacks incidents and has none cached, or
-    /// (E2) when it is live, half-time or full-time and its score
-    /// differs from the score its cached incidents were fetched
-    /// against: before E2 a cached id was never refetched, so a
-    /// live FotMob-only fixture's scorers froze at the first
-    /// fetch while its score moved on. Half-time and full-time
-    /// are included so a goal just before the break, or after
-    /// the last live poll, is still fetched. At full time a cached
-    /// match also keeps qualifying for a settling fetch on every
-    /// pass, whatever the score (late cards and any other late
-    /// incident), until it has had `fullTimeFetchBudget` (3)
-    /// ACCEPTED fetches issued at full time — a score-moved
-    /// full-time re-fetch counts toward the same budget, a lagging
-    /// result does not. After that, a finished match whose score
-    /// matches fetches nothing further. All kinds share the one
-    /// cap of 4, re-fetches first. The stamp is written with the
-    /// cache entry (`storeDetails`), which also holds the
-    /// consistency rule.
-    private func upgradeLiveFotMobDetails() async {
-        let ordered = states.sorted {
+    /// at 4 per pass, live first, cached ids never refetched,
+    /// only states lacking incidents qualify — but applied to
+    /// the cycle's merged snapshot BEFORE it is published, so
+    /// the incidents land in the same single publish as the
+    /// states that need them instead of bumping `revision` again
+    /// per fetch. `detailCache` is written exactly as before, so
+    /// the next cycle's inheritance pass sees the same cache.
+    private func applyFotMobDetails(to snapshot: inout [MatchState]) async {
+        let ordered = snapshot.sorted {
             ($0.status.isLiveish ? 0 : 1) < ($1.status.isLiveish ? 0 : 1)
         }
-        // E2 (P3): re-fetch targets fill the cap of 4 BEFORE
-        // first-fetch targets, so uncached states from the whole
-        // day's feed cannot starve them. Which states qualify as a
-        // first fetch is unchanged.
-        typealias Target = (id: Int, issued: DetailStamp, log: String?)
-        var refetches: [Target] = []
-        var firstFetches: [Target] = []
+        var targets: [Int] = []
         for state in ordered {
-            guard state.source == .fotmob, let id = state.fotmobID else { continue }
-            let issued = DetailStamp(home: state.scoreHome, away: state.scoreAway,
-                                     atFullTime: state.status == .fullTime)
-            guard detailCache[id] != nil else {
-                if state.goals.isEmpty && state.cards.isEmpty {
-                    firstFetches.append((id, issued, nil))
-                }
-                continue
-            }
-            let stamp = detailStamp[id]
-            // Score moved since the issued-against score, while
-            // live, half-time or full-time. A missing stamp counts
-            // as moved (fail open): a cache entry with no stamp is
-            // exactly the state that used to freeze.
-            let scoreMoved = (state.status.isLiveish || state.status == .fullTime)
-                && (stamp.map {
-                    $0.home != state.scoreHome || $0.away != state.scoreAway
-                } ?? true)
-            // Full-time settling fetch: at every full-time pass,
-            // whatever the score (late cards and other incidents),
-            // until 3 fetches issued at full time have been ACCEPTED
-            // (stored with an advanced stamp) for this id.
-            let fullTimeAccepted = stamp?.fullTimeAccepted ?? 0
-            let settling = state.status == .fullTime
-                && fullTimeAccepted < Self.fullTimeFetchBudget
-            guard scoreMoved || settling else { continue }
-            let log: String
-            if scoreMoved {
-                func score(_ home: Int?, _ away: Int?) -> String {
-                    "\(home.map { "\($0)" } ?? "?")-\(away.map { "\($0)" } ?? "?")"
-                }
-                let from = score(stamp?.home, stamp?.away)
-                let to = score(state.scoreHome, state.scoreAway)
-                log = "fotmob details refetch: id=\(id) score \(from) -> \(to)"
-            } else {
-                log = "fotmob details full-time settle: id=\(id) "
-                    + "accepted \(fullTimeAccepted)/\(Self.fullTimeFetchBudget)"
-            }
-            refetches.append((id, issued, log))
+            guard targets.count < 4,
+                  state.source == .fotmob,
+                  let id = state.fotmobID,
+                  state.goals.isEmpty, state.cards.isEmpty,
+                  detailCache[id] == nil else { continue }
+            targets.append(id)
         }
-        let targets = Array((refetches + firstFetches).prefix(4))
         if targets.isEmpty { return }
-        for target in targets {
-            if let line = target.log { DiagLog.log("cluster", line) }
-        }
-        for target in targets {
-            let id = target.id
+        for id in targets {
             if let details = await MatchStateClient.fetchFotMobDetails(matchID: id) {
-                storeDetails(details, for: id, issued: target.issued)
-                var changed = false
-                for i in states.indices
-                where states[i].source == .fotmob && states[i].fotmobID == id {
-                    states[i].goals = details.goals
-                    states[i].cards = details.cards
-                    changed = true
+                detailCache[id] = details
+                for i in snapshot.indices
+                where snapshot[i].source == .fotmob && snapshot[i].fotmobID == id {
+                    snapshot[i].goals = details.goals
+                    snapshot[i].cards = details.cards
                 }
-                if changed { revision += 1 }
             }
         }
-    }
-
-    /// The issue-time stamp for FotMob match `id`: its own raw
-    /// FotMob state's score and status right now, or nil when the
-    /// store holds no FotMob state for it.
-    private func issueStamp(for id: Int) -> DetailStamp? {
-        guard let state = states.first(where: {
-            $0.source == .fotmob && $0.fotmobID == id
-        }) else { return nil }
-        return DetailStamp(home: state.scoreHome, away: state.scoreAway,
-                           atFullTime: state.status == .fullTime)
-    }
-
-    /// Writes one fetched details result (E2). Every fetch path
-    /// stores through here, and the stamp is written in the same
-    /// step as the cache entry — with two deliberate exceptions
-    /// that leave the stamp behind the cache: a nil `issued` (no
-    /// FotMob state at issue time) writes the cache with NO stamp,
-    /// and a lagging result (below) keeps the previous stamp. Both
-    /// are re-fetched by `upgradeLiveFotMobDetails`: a missing
-    /// stamp counts as a moved score (fail open), and a kept stamp
-    /// still differs from the current score or still has budget.
-    ///
-    /// Consistency rule (E2, P4): when the issued score is known on
-    /// both sides, the result must list at least `home + away`
-    /// goal events. A result listing fewer is still cached and
-    /// shown (as before E2), but the stamp is NOT advanced, so the
-    /// next pass fetches again. Lagging results are counted per
-    /// EPISODE — the issued score and full-time flag: a lagging
-    /// result for the same episode as the banked one adds 1, a
-    /// lagging result for any other episode restarts the count at
-    /// 1. On the `maxDetailRejects`-th (3rd) consecutive lagging
-    /// result for the same episode the stamp is advanced anyway,
-    /// so a feed that never lists every goal cannot cause a fetch
-    /// on every pass forever. An unknown issued score cannot be
-    /// checked: the stamp is written as issued.
-    ///
-    /// An accepted stamp carries `fullTimeAccepted` forward from
-    /// the previous stamp, plus 1 when this fetch was issued at
-    /// full time (the full-time settling budget).
-    private func storeDetails(_ details: (goals: [GoalEvent], cards: [CardEvent]),
-                              for id: Int, issued: DetailStamp?) {
-        detailCache[id] = details
-        guard let issued else { return }
-        if let home = issued.home, let away = issued.away,
-           details.goals.count < home + away {
-            let rejects: Int
-            if let banked = detailRejects[id], banked.episode.sameEpisode(as: issued) {
-                rejects = banked.count + 1
-            } else {
-                rejects = 1
-            }
-            DiagLog.log("cluster",
-                        "fotmob details lag: id=\(id) listed \(details.goals.count) "
-                        + "goal(s) for \(home)-\(away) — attempt \(rejects)/\(Self.maxDetailRejects)")
-            if rejects < Self.maxDetailRejects {
-                detailRejects[id] = (issued, rejects)
-                return
-            }
-        }
-        detailRejects[id] = nil
-        var stamp = issued
-        stamp.fullTimeAccepted = (detailStamp[id]?.fullTimeAccepted ?? 0)
-            + (issued.atFullTime ? 1 : 0)
-        detailStamp[id] = stamp
     }
 
     /// The state bound to a fixture channel, if any: pair-key +
@@ -1422,11 +1523,24 @@ final class MatchStateStore: ObservableObject {
         guard let key = MatchMatching.pairKey(of: channel),
               let kickoff = channel.kickoff else { return nil }
         let fixtureDateKey = FixtureGrouping.stampDateKey(of: kickoff)
-        let candidates = states.filter {
-            $0.pairKey == key
-                && MatchMatching.datesAgree(fixtureKickoff: kickoff,
-                                            fixtureDateKey: fixtureDateKey,
-                                            state: $0)
+        // FIX-141: candidates come from the pairKey index (built
+        // on first use after any `states` mutation), not a full
+        // scan. The bucket preserves the original `states` order,
+        // so filtering it by date agreement yields the identical
+        // candidate sequence the old whole-array filter produced;
+        // everything below (marker discipline, precedence,
+        // staleness override, pool fill) is untouched.
+        if stateIndex == nil {
+            var built: [String: [MatchState]] = [:]
+            for state in states {
+                built[state.pairKey, default: []].append(state)
+            }
+            stateIndex = built
+        }
+        let candidates = (stateIndex?[key] ?? []).filter {
+            MatchMatching.datesAgree(fixtureKickoff: kickoff,
+                                     fixtureDateKey: fixtureDateKey,
+                                     state: $0)
         }
         // Marker discipline (Addendum 2 §A2.1, applied to states):
         // a state whose women's markedness matches the fixture's
@@ -1599,21 +1713,38 @@ final class MatchStateStore: ObservableObject {
             targets.append(id)
         }
         if targets.isEmpty { return }
+        // FIX-141 round 2: the revision bump lands at the
+        // mutation itself — in the same non-suspending segment
+        // as the mutation and the index invalidation below, with
+        // no await between them. PlaylistStore's entries(for:)
+        // memo keys on `revision`, so the revision can never lag
+        // the states it names: a render landing between fetches
+        // (this loop suspends on each fetch) always keys on a
+        // revision that already counts every mutation so far.
+        // This restores the invariant every other mutation site
+        // in this store already keeps — the empty-snapshot clear
+        // (:1373–1374) and the refresh publish (:1404/:1412)
+        // pair each `states` mutation with its bump in the same
+        // synchronous segment. (Round 1 accumulated the bump and
+        // applied it once after the loop; gate round 2 showed
+        // that left "same revision ⇒ same states" false for the
+        // whole in-loop window.)
         for id in targets {
-            // E2: the stamp is captured at issue time, before the
-            // await — `refreshing` does not cover this path, so a
-            // refresh may replace `states` while the fetch runs.
-            let issued = issueStamp(for: id)
             if let details = await MatchStateClient.fetchFotMobDetails(matchID: id) {
-                storeDetails(details, for: id, issued: issued)
-                var changed = false
+                detailCache[id] = details
                 for i in states.indices
                 where states[i].source == .fotmob && states[i].fotmobID == id {
                     states[i].goals = details.goals
                     states[i].cards = details.cards
-                    changed = true
+                    // FIX-141: invalidate — and bump — at the
+                    // mutation itself, not at the end — a render
+                    // landing between fetches must never read
+                    // index copies of a state this loop has
+                    // already rewritten, nor key the entries
+                    // memo on a revision that predates it.
+                    stateIndex = nil
+                    revision += 1
                 }
-                if changed { revision += 1 }
             }
         }
     }
