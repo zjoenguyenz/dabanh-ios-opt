@@ -239,6 +239,10 @@ final class MUChromeViews {
     /// that settled last (recorded at the settle, before
     /// any toggle the settle services can arm another).
     var lastSettledArmedAt: CFTimeInterval = 0
+    /// FIX-148: the transition coordinator whose
+    /// transition is being handled — a second delivery of
+    /// the same one (direct + forwarded) is ignored.
+    weak var activeTransitionCoordinator: AnyObject?
     /// FIX-147: the after-exit fallback's generation — a
     /// one-shot guard per request (no timer, no repeat),
     /// so a stale fallback from an earlier request never
@@ -337,6 +341,28 @@ final class MUFullscreenViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
+    }
+
+    /// FIX-148: forward the window's transition to the
+    /// hosted player surface. While its view is hosted
+    /// here, the surface's own controller is outside the
+    /// window's controller hierarchy (its parent, the
+    /// cover's SwiftUI host, was removed from the window by
+    /// this .fullScreen presentation), so UIKit delivers the
+    /// turn to THIS controller only — and the enter turn
+    /// ran with no rigid flight, no in-flight state and no
+    /// settle (DEVICE-147: zero flight lines on 5/5
+    /// enters). This adds no animation and no animator: the
+    /// surface schedules its own alongside work on the
+    /// SAME system coordinator, exactly as on a direct
+    /// delivery. Forwarded only while the hosted view is
+    /// actually inside this controller's view.
+    override func viewWillTransition(to size: CGSize,
+                                     with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+        guard let hosted = MUFullscreenState.hostedController,
+              hosted.isViewLoaded, hosted.view.superview === view else { return }
+        hosted.muHostedWillTransition(to: size, with: coordinator)
     }
 
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask { .all }

@@ -987,7 +987,47 @@ final class LivePlayerViewController: UIViewController {
     override func viewWillTransition(to size: CGSize,
                                      with coordinator: UIViewControllerTransitionCoordinator) {
         super.viewWillTransition(to: size, with: coordinator)
+        muWillTransition(to: size, with: coordinator, forwarded: false)
+    }
+
+    /// FIX-148: the window's transition, forwarded by the
+    /// fullscreen controller while this surface's view is
+    /// hosted inside it (MUFullscreenViewController). While
+    /// hosted, UIKit never delivers viewWillTransition here:
+    /// this controller's parent chain is the cover's SwiftUI
+    /// host, which the .fullScreen presentation has taken
+    /// out of the window, and the transition is delivered to
+    /// the presented controller instead. The forwarded call
+    /// runs the SAME MU transition path as a direct one.
+    func muHostedWillTransition(to size: CGSize,
+                                with coordinator: UIViewControllerTransitionCoordinator) {
+        muWillTransition(to: size, with: coordinator, forwarded: true)
+    }
+
+    /// The MU transition path (FIX-142/143/147), shared by
+    /// the direct delivery and the FIX-148 forward. One
+    /// transition is handled ONCE: a second delivery of the
+    /// same coordinator (direct + forwarded, e.g. an exit
+    /// whose turn starts with the view still hosted) is
+    /// ignored and logged.
+    private func muWillTransition(to size: CGSize,
+                                  with coordinator: UIViewControllerTransitionCoordinator,
+                                  forwarded: Bool) {
         guard isMUChrome, let mu = muChrome else { return }
+        let key = coordinator as AnyObject
+        if let active = mu.activeTransitionCoordinator, active === key {
+            DiagLog.log("player",
+                        "mu transition: second delivery of the same transition "
+                        + "(\(forwarded ? "forwarded" : "direct")) — ignored")
+            return
+        }
+        mu.activeTransitionCoordinator = key
+        if forwarded {
+            DiagLog.log("player",
+                        "mu transition: forwarded from the fullscreen controller "
+                        + "size=\(Int(size.width.rounded()))x\(Int(size.height.rounded())) "
+                        + "from=\(Int(view.bounds.width.rounded()))x\(Int(view.bounds.height.rounded()))")
+        }
         mu.transitionInFlight = true
         mu.inFlightPassCount = 0
         // FIX-147: arm the picture's rigid flight (see
