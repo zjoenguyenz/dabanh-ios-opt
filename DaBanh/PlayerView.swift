@@ -1053,6 +1053,7 @@ final class LivePlayerViewController: UIViewController {
         // guard below: a window must never be left on the
         // turn clock, even for a dead player.
         endMUTurnClock()
+        mu.lastSettledArmedAt = mu.flightArmedAt
         retireMURigidFlight()
         mu.transitionInFlight = false
         // Gate fix (REVIEW-142 B-2): a completion landing
@@ -1067,6 +1068,7 @@ final class LivePlayerViewController: UIViewController {
             mu.pendingToggle = false
             mu.afterExitClose = false
             mu.openBoardAfterExit = false
+            mu.afterExitAwaitingHosting = false
             return
         }
         let frameBefore = videoView.frame
@@ -1768,7 +1770,7 @@ final class LivePlayerViewController: UIViewController {
         if isMUChrome {
             // FIX-147: a teardown inside a turn must not
             // leave the window on the turn clock.
-            endMUTurnClock()
+            endMUTurnClock(reason: "teardown")
             releaseMUFullscreenHostingForTeardown()
         }
         hideTimer?.invalidate()

@@ -217,12 +217,28 @@ final class MUChromeViews {
     /// the portrait rest (serviceMUAfterExit), so the cover
     /// is never dismissed in landscape.
     var afterExitClose = false
-    /// FIX-147: one extra exit attempt is allowed when a
-    /// settle lands on the landscape page while a close is
-    /// still waiting (e.g. a parity-serviced toggle
-    /// re-entered fullscreen); past that, the close goes
-    /// ahead rather than loop.
+    /// FIX-147 (R2, Finding 2): the after-exit exit has
+    /// been ISSUED (a toggle that turns to portrait has
+    /// run since the request), and when. A settle can only
+    /// count as a failed landing of that exit if its
+    /// transition began after this instant.
+    var afterExitExitIssued = false
+    var afterExitIssuedAt: CFTimeInterval = 0
+    /// FIX-147 (R2): the ONE retry, spent only by a settle
+    /// that landed on the landscape page although its
+    /// transition began after the exit was issued — a
+    /// landing that genuinely failed to reach portrait.
+    /// Nothing else (the dismissal completion included)
+    /// may spend it.
     var afterExitRetried = false
+    /// FIX-147 (R2): a portrait settle found the hosting
+    /// still presented; the dismissal's completion runs
+    /// the waiting action — and only in that case.
+    var afterExitAwaitingHosting = false
+    /// FIX-147 (R2): the arm instant of the transition
+    /// that settled last (recorded at the settle, before
+    /// any toggle the settle services can arm another).
+    var lastSettledArmedAt: CFTimeInterval = 0
     /// FIX-147: the after-exit fallback's generation — a
     /// one-shot guard per request (no timer, no repeat),
     /// so a stale fallback from an earlier request never
@@ -251,13 +267,6 @@ final class MUChromeViews {
     var flightDuration: TimeInterval = 0
     var flightCurve: UIView.AnimationCurve = .easeInOut
     var flightArmedAt: CFTimeInterval = 0
-    /// FIX-147 — the turn clock: the window layer the
-    /// clock was applied to, and its timing before, so
-    /// endMUTurnClock restores it exactly.
-    weak var turnClockLayer: CALayer?
-    var turnClockSavedSpeed: Float = 1
-    var turnClockSavedBeginTime: CFTimeInterval = 0
-    var turnClockSavedTimeOffset: CFTimeInterval = 0
     let scrimTop = UIView()
     let scrimBottom = UIView()
     var chipButtons: [UIButton] = []
@@ -1165,7 +1174,7 @@ extension LivePlayerViewController {
             videoView.center = endCenter
             videoView.transform = .identity
         } else {
-            let speed = Double(mu.turnClockLayer != nil ? Self.muTurnSpeed : 1)
+            let speed = Double(MUTurnClock.isRunning ? Self.muTurnSpeed : 1)
             let elapsedLocal = (CACurrentMediaTime() - mu.flightArmedAt) * speed
             let remaining = max(0.05, mu.flightDuration - elapsedLocal)
             let curve = UIView.AnimationOptions(rawValue: UInt(mu.flightCurve.rawValue) << 16)
@@ -1206,40 +1215,24 @@ extension LivePlayerViewController {
         return pictureWidth(start) / endWidth
     }
 
-    /// FIX-147: start the turn clock on this window (see
-    /// muTurnSpeed). The window layer's local time is kept
-    /// continuous at the switch (beginTime = now,
-    /// timeOffset = its local time now), so nothing already
-    /// running jumps; the turn's own animations, created
-    /// after this call, then run at the faster rate.
+    /// FIX-147: start the turn clock for this turn (see
+    /// muTurnSpeed and MUTurnClock).
     func beginMUTurnClock() {
-        guard let mu = muChrome, mu.turnClockLayer == nil,
-              Self.muTurnSpeed > 1,
+        guard muChrome != nil, Self.muTurnSpeed > 1,
               let layer = view.window?.layer else { return }
-        let now = CACurrentMediaTime()
-        let local = layer.convertTime(now, from: nil)
-        mu.turnClockSavedSpeed = layer.speed
-        mu.turnClockSavedBeginTime = layer.beginTime
-        mu.turnClockSavedTimeOffset = layer.timeOffset
-        layer.speed = layer.speed * Self.muTurnSpeed
-        layer.beginTime = now
-        layer.timeOffset = local
-        mu.turnClockLayer = layer
-        DiagLog.log("player", "mu turn clock: on ×\(Self.muTurnSpeed)")
+        MUTurnClock.begin(layer: layer, rate: Self.muTurnSpeed,
+                          expectedDuration: muChrome?.flightDuration ?? 0)
     }
 
-    /// FIX-147: end the turn clock — the window layer's
-    /// speed, beginTime and timeOffset return to exactly
-    /// what they were. Called first thing in the turn's
-    /// completion, on the no-animation path, and at
-    /// teardown; a no-op when no clock is running.
-    func endMUTurnClock() {
-        guard let mu = muChrome, let layer = mu.turnClockLayer else { return }
-        mu.turnClockLayer = nil
-        layer.speed = mu.turnClockSavedSpeed
-        layer.beginTime = mu.turnClockSavedBeginTime
-        layer.timeOffset = mu.turnClockSavedTimeOffset
-        DiagLog.log("player", "mu turn clock: off")
+    /// FIX-147: end the turn clock — time-continuously
+    /// (MUTurnClock.end). Called first thing in the turn's
+    /// completion (the settle AND the refusal path both
+    /// run finishMURotation) and at teardown; the clock is
+    /// process-wide, so a superseded surface's turn is
+    /// ended by whichever surface settles or tears down
+    /// next, and by the clock's own one-shot guard.
+    func endMUTurnClock(reason: String = "settle") {
+        MUTurnClock.end(reason: reason)
     }
 
     // MARK: - After-exit actions: close / board (FIX-147)
@@ -1265,55 +1258,116 @@ extension LivePlayerViewController {
             return true
         }
         if mu.transitionInFlight {
+            resetMUAfterExitBookkeeping(mu)
             mu.afterExitClose = true
-            mu.afterExitRetried = false
             DiagLog.log("player",
-                        "close: tapped mid-turn — closing at the next settle")
+                        "close: tapped mid-turn — deciding at the next settle")
             armMUAfterExitFallback()
             return true
         }
         guard mu.landscape else { return false }
+        resetMUAfterExitBookkeeping(mu)
         mu.afterExitClose = true
-        mu.afterExitRetried = false
         DiagLog.log("player",
                     "close: tapped on the landscape page — turning to portrait first, "
                     + "closing at the portrait rest")
-        muToggleFullscreen()
-        armMUAfterExitFallback()
+        issueMUAfterExitExit(mu, why: "close tap")
         return true
     }
 
-    /// FIX-147: service a waiting close / board request.
-    /// Called at every settle (finishMURotation, after the
-    /// parity-queued toggle) and from the hosting
-    /// dismissal's completion. It acts only at a PORTRAIT
-    /// rest with the hosting home; on a landscape settle it
-    /// waits for the turn that is coming (a toggle serviced
-    /// in the same settle), or — for a close — issues one
-    /// more exit.
+    private func resetMUAfterExitBookkeeping(_ mu: MUChromeViews) {
+        mu.afterExitExitIssued = false
+        mu.afterExitIssuedAt = 0
+        mu.afterExitRetried = false
+        mu.afterExitAwaitingHosting = false
+    }
+
+    /// FIX-147 (R2): run the unchanged FIX-139 toggle from
+    /// the landscape page (an exit) on behalf of a waiting
+    /// action, record that the exit is issued, and arm the
+    /// one-shot guard for it.
+    private func issueMUAfterExitExit(_ mu: MUChromeViews, why: String) {
+        mu.afterExitExitIssued = true
+        mu.afterExitIssuedAt = CACurrentMediaTime()
+        DiagLog.log("player", "after-exit: exit issued (\(why))")
+        muToggleFullscreen()
+        armMUAfterExitFallback()
+    }
+
+    /// FIX-147 (R2): service a waiting close / board
+    /// request at a SETTLE — called only from
+    /// finishMURotation, after the parity-queued toggle
+    /// (Finding 2: the hosting dismissal's completion no
+    /// longer calls this; see completeMUAfterExitAtHostingHome).
+    ///
+    ///   portrait settle — run the action, unless the
+    ///     settle itself serviced a toggle (that was an
+    ///     ENTER about to turn the window: wait), or the
+    ///     hosting is not home yet (mark it; the
+    ///     dismissal's completion finishes the job).
+    ///   landscape settle —
+    ///     a toggle serviced in this settle: from the
+    ///       landscape page that is an exit; it counts as
+    ///       the issued exit.
+    ///     no exit issued yet (a tap that landed mid-turn):
+    ///       issue it now — this is the first exit, not a
+    ///       retry.
+    ///     exit issued, and THIS settle's transition began
+    ///       after it: the exit's landing failed to reach
+    ///       portrait — spend the one retry.
+    ///     exit issued, this transition began before it:
+    ///       the exit's own turn has not landed yet — wait.
     func serviceMUAfterExit(servicedToggleThisSettle: Bool) {
         guard let mu = muChrome, !isTorn,
               mu.afterExitClose || mu.openBoardAfterExit,
               !mu.transitionInFlight else { return }
         if !mu.landscape {
-            // A toggle serviced from portrait in this same
-            // settle is an ENTER that is about to turn the
-            // window — wait for its settle instead.
             if servicedToggleThisSettle { return }
-            // The hosting must be home first; the
-            // dismissal's completion calls back here.
-            guard MUFullscreenState.presentedController == nil else { return }
+            guard MUFullscreenState.presentedController == nil else {
+                mu.afterExitAwaitingHosting = true
+                DiagLog.log("player",
+                            "after-exit: portrait settle — waiting for the hosting to be home")
+                return
+            }
             runMUAfterExitActions(reason: "portrait rest")
             return
         }
-        if servicedToggleThisSettle { return }
-        if mu.afterExitClose, !mu.afterExitRetried {
-            mu.afterExitRetried = true
-            DiagLog.log("player",
-                        "close: settled on the landscape page — one more turn to portrait")
-            muToggleFullscreen()
+        if servicedToggleThisSettle {
+            mu.afterExitExitIssued = true
+            mu.afterExitIssuedAt = CACurrentMediaTime()
             armMUAfterExitFallback()
+            return
         }
+        if !mu.afterExitExitIssued {
+            issueMUAfterExitExit(mu, why: "landscape settle after a mid-turn request")
+            return
+        }
+        if mu.lastSettledArmedAt > mu.afterExitIssuedAt {
+            if mu.afterExitClose, !mu.afterExitRetried {
+                mu.afterExitRetried = true
+                DiagLog.log("player",
+                            "close: the exit's landing settled on the landscape page "
+                            + "— the one retry")
+                issueMUAfterExitExit(mu, why: "retry")
+            }
+            return
+        }
+        DiagLog.log("player",
+                    "after-exit: landscape settle of a turn that began before the exit "
+                    + "— waiting for the exit's own turn")
+    }
+
+    /// FIX-147 (R2, Finding 2): the hosting dismissal's
+    /// completion. It never decides, never issues an exit
+    /// and never spends the retry: it only finishes an
+    /// action a PORTRAIT settle already approved and parked
+    /// for want of the hosting (afterExitAwaitingHosting).
+    func completeMUAfterExitAtHostingHome() {
+        guard let mu = muChrome, !isTorn, mu.afterExitAwaitingHosting,
+              mu.afterExitClose || mu.openBoardAfterExit,
+              !mu.transitionInFlight, !mu.landscape,
+              MUFullscreenState.presentedController == nil else { return }
+        runMUAfterExitActions(reason: "portrait rest (hosting home)")
     }
 
     private func runMUAfterExitActions(reason: String) {
@@ -1321,8 +1375,8 @@ extension LivePlayerViewController {
         let close = mu.afterExitClose
         let board = mu.openBoardAfterExit
         mu.afterExitClose = false
-        mu.afterExitRetried = false
         mu.openBoardAfterExit = false
+        resetMUAfterExitBookkeeping(mu)
         mu.afterExitGeneration += 1
         let live = view.window?.windowScene?.interfaceOrientation
         if close {
@@ -1653,11 +1707,11 @@ extension LivePlayerViewController {
         // toggle (see openBoardAfterExit on MUChromeViews).
         if MUFullscreenState.presentedController != nil, let mu = muChrome {
             mu.openBoardAfterExit = true
-            muToggleFullscreen()
             // FIX-147: the board now opens at the portrait
             // rest (serviceMUAfterExit), with the same 1 s
             // one-shot guard as the close.
-            armMUAfterExitFallback()
+            if !mu.afterExitClose { resetMUAfterExitBookkeeping(mu) }
+            issueMUAfterExitExit(mu, why: "board tap")
             return
         }
         onSourceSwitch?()
@@ -2002,14 +2056,13 @@ extension LivePlayerViewController {
                             + "\(self.muFmtRect(self.view.frame)) "
                             + "(turn in flight=\(mu?.transitionInFlight ?? false))")
             }
-            // FIX-147: a waiting board (or close) request is
-            // serviced at the PORTRAIT rest, not here — this
-            // completion normally lands before the turn back
-            // has even started, and a sheet presented now
-            // would race the turn. serviceMUAfterExit acts
-            // only when the page is already portrait;
-            // otherwise the settle services it.
-            self.serviceMUAfterExit(servicedToggleThisSettle: false)
+            // FIX-147 (R2, Finding 2): a waiting board (or
+            // close) request is decided at the turn's SETTLE,
+            // never here — this completion normally lands
+            // before the turn back has even started. It only
+            // finishes an action a portrait settle already
+            // approved and parked for the hosting.
+            self.completeMUAfterExitAtHostingHome()
         }
     }
 
@@ -2268,5 +2321,78 @@ extension LivePlayerViewController {
 extension LivePlayerViewController: UIPopoverPresentationControllerDelegate {
     func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
         showControls()
+    }
+}
+
+// MARK: - FIX-147 turn clock
+
+/// FIX-147 (R2, Finding 1) — the turn clock, process-wide
+/// (one window turns at a time; any surface can end it).
+///
+/// CONTINUITY INVARIANT: the window layer's local time is
+/// a continuous function of media time at every switch.
+/// Local time is t_local = (t − beginTime) · speed +
+/// timeOffset, so each switch (on AND off) is made the same
+/// way, at one instant `now`:
+///     timeOffset ← local time at `now` (convertTime)
+///     beginTime  ← now
+///     speed      ← the new rate
+/// which makes t_local(now) identical before and after the
+/// write: nothing running on the window jumps, forwards or
+/// backwards. The pre-turn beginTime / timeOffset are NOT
+/// written back — after a 1.4× turn of T seconds the
+/// window's local time correctly leads its pre-turn
+/// mapping by 0.4·T, and replaying the old values would
+/// step it back by exactly that (the R1 defect). Only the
+/// RATE is restored exactly.
+///
+/// Every way out of a turn goes through end(): the settle
+/// and the refusal path (both run finishMURotation), the
+/// player's teardown, a superseded surface (the clock is
+/// not owned by a surface — the successor's settle or
+/// teardown ends it), and, as the last guard, one one-shot
+/// check per turn at 2× the expected duration + 0.5 s
+/// (generation-checked; never repeating).
+@MainActor
+enum MUTurnClock {
+    private static weak var layer: CALayer?
+    private static var savedSpeed: Float = 1
+    private static var generation = 0
+
+    static var isRunning: Bool { layer != nil }
+
+    static func begin(layer target: CALayer, rate: Float,
+                      expectedDuration: TimeInterval) {
+        guard layer == nil else { return }
+        savedSpeed = target.speed
+        switchRate(target, to: savedSpeed * rate)
+        layer = target
+        generation += 1
+        let mine = generation
+        DiagLog.log("player", "mu turn clock: on ×\(rate)")
+        let guardDelay = max(0.6, expectedDuration * 2 + 0.5)
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(guardDelay))
+            guard generation == mine, layer != nil else { return }
+            end(reason: "guard — no settle within \(String(format: "%.2f", guardDelay))s")
+        }
+    }
+
+    static func end(reason: String) {
+        guard let target = layer else { return }
+        layer = nil
+        generation += 1
+        switchRate(target, to: savedSpeed)
+        DiagLog.log("player", "mu turn clock: off (\(reason))")
+    }
+
+    /// The one time-continuous rate switch (see the
+    /// invariant above).
+    private static func switchRate(_ target: CALayer, to speed: Float) {
+        let now = CACurrentMediaTime()
+        let local = target.convertTime(now, from: nil)
+        target.timeOffset = local
+        target.beginTime = now
+        target.speed = speed
     }
 }
