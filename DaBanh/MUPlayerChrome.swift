@@ -243,6 +243,13 @@ final class MUChromeViews {
     /// transition is being handled — a second delivery of
     /// the same one (direct + forwarded) is ignored.
     weak var activeTransitionCoordinator: AnyObject?
+    /// FIX-150: an enter decided from the portrait page
+    /// waits for the window's own turn to land before the
+    /// fullscreen controller is presented (see
+    /// presentMUFullscreenAtLandscapeRest). Set while that
+    /// presentation is owed; cleared when it is made, or
+    /// when the state it was owed to (isActive) is gone.
+    var hostingDeferred = false
     /// FIX-147: the after-exit fallback's generation — a
     /// one-shot guard per request (no timer, no repeat),
     /// so a stale fallback from an earlier request never
@@ -934,6 +941,14 @@ extension LivePlayerViewController {
         // that proven path and does not change).
         if mu.landscape != isLandscape {
             mu.landscape = isLandscape
+        }
+        // FIX-150: an owed enter presentation is made once
+        // this surface rests on the landscape page — one hop
+        // later, never from inside this layout pass.
+        if mu.hostingDeferred, isLandscape, !mu.transitionInFlight {
+            DispatchQueue.main.async { [weak self] in
+                self?.serviceMUDeferredHosting()
+            }
         }
         if !mu.transitionInFlight {
             applyMUPresentation(mu, isLandscape: isLandscape)
@@ -1889,12 +1904,88 @@ extension LivePlayerViewController {
     func syncMUFullscreenHosting() {
         guard isMUChrome, let mu = muChrome else { return }
         if MUFullscreenState.isActive {
-            guard MUFullscreenState.presentedController == nil else { return }
-            beginMUFullscreenPresentation(mu)
+            guard MUFullscreenState.presentedController == nil else {
+                mu.hostingDeferred = false
+                return
+            }
+            presentMUFullscreenAtLandscapeRest(mu, why: "toggle")
         } else {
+            if mu.hostingDeferred {
+                mu.hostingDeferred = false
+                DiagLog.log("player",
+                            "mu fullscreen hosting: deferred presentation cancelled (exit)")
+            }
             guard MUFullscreenState.presentedController != nil else { return }
             beginMUFullscreenDismissal(mu)
         }
+    }
+
+    /// FIX-150 — ENTER ORDER: turn first, then host.
+    ///
+    /// The shipped order presented the fullscreen
+    /// controller in the same main-thread turn as the
+    /// FIX-139 geometry request. The scene's landscape
+    /// geometry then landed while that .fullScreen
+    /// presentation was still in progress (DEVICE-149: the
+    /// first and only layout, viewDidAppear and the present
+    /// completion all at +0.41 s, the window already 956x440
+    /// with interface=1). No coordinated rotation ran — no
+    /// viewWillTransition anywhere — so the canvas cut, and
+    /// the interface orientation caught up afterwards with
+    /// no size change: the ~84° swing.
+    ///
+    /// Now an enter decided while the page is still
+    /// portrait (or while a turn is in flight) presents
+    /// nothing yet. The geometry request is judged against
+    /// the cover's host — the topmost controller, exactly as
+    /// on every exit — so the window runs its ordinary
+    /// coordinated turn, delivered to this surface directly,
+    /// and the shipped rigid flight carries the picture
+    /// (FIX-147). At the landscape REST the presentation is
+    /// made (serviceMUDeferredHosting): the window is
+    /// already landscapeRight, the app mask .landscape, so
+    /// presenting changes no orientation — the view moves
+    /// into a container of the same size at the same place.
+    /// At a landscape rest it presents immediately, as
+    /// before.
+    func presentMUFullscreenAtLandscapeRest(_ mu: MUChromeViews, why: String) {
+        if !mu.landscape || mu.transitionInFlight {
+            if !mu.hostingDeferred {
+                DiagLog.log("player",
+                            "mu fullscreen hosting: deferred to the landscape rest (\(why)) "
+                            + "layoutLandscape=\(mu.landscape) inFlight=\(mu.transitionInFlight)")
+            }
+            mu.hostingDeferred = true
+            return
+        }
+        mu.hostingDeferred = false
+        beginMUFullscreenPresentation(mu)
+    }
+
+    /// FIX-150: make the owed presentation once this
+    /// surface is at a landscape rest. Scheduled (one hop
+    /// on the main queue, never from inside a layout pass)
+    /// by layoutMUChrome on a rest pass with landscape
+    /// bounds — the enter's settle pass is one. Idempotent:
+    /// every guard is re-read here, so several scheduled
+    /// hops present at most once, and an exit / teardown /
+    /// close serviced in the meantime leaves nothing to do.
+    func serviceMUDeferredHosting() {
+        guard isMUChrome, let mu = muChrome, mu.hostingDeferred, !isTorn else { return }
+        guard MUFullscreenState.isActive else {
+            mu.hostingDeferred = false
+            return
+        }
+        guard MUFullscreenState.presentedController == nil else {
+            mu.hostingDeferred = false
+            return
+        }
+        guard mu.landscape, !mu.transitionInFlight else { return }
+        DiagLog.log("player",
+                    "mu fullscreen hosting: landscape rest reached — presenting "
+                    + "interface=\(view.window?.windowScene?.interfaceOrientation.rawValue ?? -1)")
+        mu.hostingDeferred = false
+        beginMUFullscreenPresentation(mu)
     }
 
     /// The presenter for the fullscreen controller: this
@@ -2131,7 +2222,10 @@ extension LivePlayerViewController {
             DiagLog.log("player",
                         "mu fullscreen hosting: successor found no "
                         + "presentation up — re-presenting")
-            beginMUFullscreenPresentation(mu)
+            // FIX-150: through the same enter-order rule —
+            // a successor born mid-turn (or still portrait)
+            // presents at its landscape rest, not mid-turn.
+            presentMUFullscreenAtLandscapeRest(mu, why: "successor")
             return
         }
         guard let host = view.superview, host !== fsVC.view else { return }
